@@ -127,7 +127,25 @@ else:
 	def _mmt_assign(x: torch.Tensor, y: torch.Tensor):
 		torch.mm(x, x.mT, out=y)
 
-# @torch.compile(fullgraph=True) # incorrect outputs on windows, might work on linux
+try:
+	@torch.compile(dynamic=False, fullgraph=True)
+	@torch.no_grad()
+	def test(x: torch.Tensor):
+		return x + 1.
+	
+	x = test(torch.tensor([1.0, 2.0]).cuda())
+	assert torch.allclose(x.cpu(), torch.tensor([2.0, 3.0]))
+
+	del x
+	del test
+	_optional_compile = torch.compile # type: ignore
+except Exception as e:
+	def _optional_compile(model: None = None, *, fullgraph: bool = False, dynamic: bool = False):
+		def fn(c):
+			return c
+		return fn
+
+@_optional_compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
 def _zeropower_via_newtonschulz(
 	G: torch.Tensor,
