@@ -145,44 +145,100 @@ except Exception as e:
 			return c
 		return fn
 
+def _optimal_composition(l: float, num_iters: int, safety_factor_eps: float = 0.0, cushion: float = 0.0):
+    """
+    Calculate coefficients for `_polar_decomp`, from https://arxiv.org/pdf/2505.16932
+    """
+    u = 1.
+    assert 0 <= l <= u
+
+    def optimal_quintic(l: float, u: float):
+        assert 0 <= l <= u
+
+        if 1. - 5e-6 <= l / u:
+            return (15. / 8.) / u, \
+                (-10. / 8.) / (u ** 3.), \
+                (3. / 8.) / (u ** 5.)
+
+        q = (3. * l + 1.) / 4.
+        r = (l + 3.) / 4.
+        E, old_E = float('inf'), None
+        a, b, c = 1., 1., 1.
+        while not old_E or abs(old_E - E) > 1e-15:
+            old_E = E
+            LHS = torch.tensor([
+                [l, l ** 3., l ** 5.,  1.],
+                [q, q ** 3., q ** 5., -1.],
+                [r, r ** 3., r ** 5.,  1.],
+                [u, u ** 3., u ** 5., -1.],
+            ], dtype=torch.double)
+            a, b, c, E = torch.linalg.solve(LHS, torch.ones(4, dtype=torch.double))
+            q, r = torch.sqrt((-3. * b + torch.tensor([-1., 1.], dtype=torch.double) * (9. * b ** 2. - 20. * a * c) ** 0.5) / (10. * c))
+        return float(a), float(b), float(c)
+
+    safety_factor = 1. + safety_factor_eps
+    coefficients = []
+    for iter in range(num_iters):
+        a, b, c = optimal_quintic(max(l, cushion * u), u)
+        if cushion * u > l:
+            pl = a * l + b * l ** 3. + c * l ** 5.
+            pu = a * u + b * u ** 3. + c * u ** 5.
+            rescaler = 2. / (pl + pu)
+            a = a * rescaler
+            b = b * rescaler
+            c = c * rescaler
+
+        if iter < num_iters - 1:
+            a = a / safety_factor
+            b = b / safety_factor ** 3.
+            c = c / safety_factor ** 5.
+
+        coefficients.append((a, b, c))
+        
+        l = a * l + b * l ** 3. + c * l ** 5.
+        u = 2. - l
+
+    return coefficients
+
 @_optional_compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def _zeropower_via_newtonschulz(
+def _polar_decomp(
 	G: torch.Tensor,
-	steps: int = 5,
+	coeffs: list[tuple[float, float, float]],
+	steps: int | None = None,
 	eps: float = 1e-7,
-	gram: bool = False
+	safety_factor_eps: float = 0.0
 ):
-	assert G.ndim == 2
-
 	X = G
 	if G.size(-2) > G.size(-1):
 		X = X.mT
 
 	# Ensure spectral norm is at most 1
-	X = X / (X.norm() + eps)
+	X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1. + safety_factor_eps) + eps)
 
-	A = torch.empty(X.size(0), X.size(0), dtype=X.dtype, device=X.device)
-	AA = torch.empty(X.size(0), X.size(0), dtype=X.dtype, device=X.device)
+	X = X.contiguous()
+	A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+	AA = torch.empty_like(A)
+	B = torch.empty_like(A)
+	C = torch.empty_like(X)
 
-	# Newton-Schulz iterations
-	for i, (a, b, c) in enumerate([
-		(4.0848, -6.8946, 2.9270),
-		(3.9505, -6.3029, 2.6377),
-		(3.7418, -5.5913, 2.3037),
-		(2.8769, -3.1427, 1.2046),
-		(2.8366, -3.0525, 1.2012)
-	][:steps]):
+	is_large_matrix = G.size(-2) > 1024 or G.size(-1) > 1024
+	_mm = torch.bmm if X.ndim > 2 else torch.mm
+	_addmm = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+	for i, (a, b, c) in enumerate(coeffs[:steps]):
 		_mmt_assign(X, A) # A = X @ X.mT
-		if i == 0 and gram:
-			# Tighter estimate of spectral norm using 1st Gram iteration: https://arxiv.org/pdf/2305.16173
-			S = A.norm()
-			X = X / (S ** 0.5 + eps)
-			A = A / (S + eps)
-
 		_mmt_assign(A, AA) # AA = A @ A.mT - note that AA = AA^T because A is symmetrical.
-		B = b * A + c * AA # torch.addmm(A, A, A, alpha=c, beta=b)
-		X = torch.addmm(X, B, X, alpha=1.0, beta=a) # X = a * X + B @ X
+		A.mul_(b) # A = b * A
+		torch.add(A, AA, alpha=c, out=B) # B = A + c * AA
+		
+		if is_large_matrix:
+			_mm(B, X, out=C) # C = B @ X
+			C.add_(X, alpha=a) # C = C + a * X
+		else:
+			_addmm(X, B, X, beta=a, out=C) # C = a * X + B @ X
+
+		X, C = C, X
 
 	if G.size(-2) > G.size(-1):
 		X = X.mT
@@ -263,10 +319,11 @@ def _compute_u(
 	state: _THORNState,
 	rank: int,
 	compute_stream: cuda.Stream,
+	coeffs: list[tuple[float, float, float]],
 	steps: int = 5,
 	beta2: float = 0.95,
 	eps: float = 1e-7,
-	gram: bool = False
+	safety_factor_eps: float = 0.0
 ):
 	with cuda.stream(compute_stream):
 		if rank == state.worker_rank:
@@ -276,8 +333,9 @@ def _compute_u(
 			compute_stream.wait_event(state.gather_event)
 			assert state.gathered_grad is not None
 
-			u = _zeropower_via_newtonschulz(state.gathered_grad, steps, gram=gram)
-			u = _apply_per_neuron_norm(u, v, beta2=beta2, eps=eps)
+			u = _polar_decomp(state.gathered_grad, coeffs, steps, eps=eps, safety_factor_eps=safety_factor_eps)
+			if beta2 > 0.0:
+				u = _apply_per_neuron_norm(u, v, beta2=beta2, eps=eps)
 
 			state.computed_u = u
 		
@@ -439,9 +497,12 @@ class _THORNParameterGroup(TypedDict):
 	cautious: bool
 	lr: float
 	betas: tuple[float, float]
-	ns_steps: int
+	iters: int
 	nesterov: bool
-	gram: bool
+	lower_bound: float
+	safety_factor: float
+	cushion: float
+	coeffs: list[tuple[float, float, float]]
 
 class THORNOrthogonalizedParameterGroup(TypedDict, total=True):
 	orthogonalize: Literal[True]
@@ -449,11 +510,14 @@ class THORNOrthogonalizedParameterGroup(TypedDict, total=True):
 	lr: NotRequired[float]
 	betas: NotRequired[tuple[float, float]]
 	weight_decay: NotRequired[float]
-	ns_steps: NotRequired[int]
+	iters: NotRequired[int]
 	nesterov: NotRequired[bool]
-	gram: NotRequired[bool]
 	eps: NotRequired[float]
 	none_grad: NotRequired[bool]
+	lower_bound: NotRequired[float]
+	safety_factor: NotRequired[float]
+	cushion: NotRequired[float]
+	coeffs: NotRequired[list[tuple[float, float, float]]]
 
 class THORNNonOrthogonalizedParameterGroup(TypedDict, total=True):
 	orthogonalize: Literal[False]
@@ -484,9 +548,19 @@ class THORN(Optimizer):
 				group = cast(THORNOrthogonalizedParameterGroup, group)
 				group.setdefault('lr', 0.02)
 				group.setdefault('betas', (0.95, 0.95))
-				group.setdefault('ns_steps', 5)
+				group.setdefault('iters', 5)
 				group.setdefault('nesterov', True)
-				group.setdefault('gram', False)
+				group.setdefault('lower_bound', 1e-3)
+				group.setdefault('safety_factor', 0.02)
+				group.setdefault('cushion', 0.02)
+				if not 'coeffs' in group:
+					group = cast(dict, group)
+					group['coeffs'] = _optimal_composition(
+						l=group['lower_bound'],
+						num_iters=group['iters'],
+						safety_factor_eps=group['safety_factor'],
+						cushion=group['cushion']
+					)
 			else:
 				group = cast(THORNNonOrthogonalizedParameterGroup, group)
 				group.setdefault('lr', 3e-4)
@@ -539,7 +613,7 @@ class THORN(Optimizer):
 
 			g = _resize(g)
 
-			flops = self._calc_flops(g, group['ns_steps'])
+			flops = self._calc_flops(g, group['iters'])
 			param_to_flops[id(p)] = flops
 			total_flops += flops
 
@@ -585,8 +659,15 @@ class THORN(Optimizer):
 		g = _resize(p.grad)
 
 		u = self._update_momentum(p, g, group)
-		u = _zeropower_via_newtonschulz(u.float(), steps=group['ns_steps'], eps=group['eps'], gram=group['gram']).to(dtype=p.dtype)
-		u = _apply_per_neuron_norm(u, state['variance'], beta2=group['betas'][1], eps=group['eps'])
+		u = _polar_decomp(
+			u.float(),
+			coeffs=group['coeffs'],
+			steps=group['iters'],
+			eps=group['eps'],
+			safety_factor_eps=group['safety_factor']
+		).to(dtype=p.dtype)
+		if group['betas'][1] > 0.0:
+			u = _apply_per_neuron_norm(u, state['variance'], beta2=group['betas'][1], eps=group['eps'])
 		
 		scale = self._lr_scale_ortho(p)
 		_apply_param_update(p, u.view_as(p), group['lr'], group['weight_decay'], scale=scale)
@@ -619,10 +700,11 @@ class THORN(Optimizer):
 					state,
 					rank=self.rank,
 					compute_stream=self.compute_stream,
-					steps=group['ns_steps'],
+					coeffs=group['coeffs'],
+					steps=group['iters'],
 					beta2=group['betas'][1],
 					eps=group['eps'],
-					gram=group['gram']
+					safety_factor_eps=group['safety_factor']
 				)
 
 		def enqueue_scatters(start_idx: int, chunk_size: int):

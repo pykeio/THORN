@@ -1,7 +1,7 @@
 # THORN 🌹
 THORN is an optimizer for PyTorch.
 
-It's often a little better than [Muon](https://kellerjordan.github.io/posts/muon/), is definitely faster, uses less memory, & supports FSDP.
+It's often a little better than [Muon](https://kellerjordan.github.io/posts/muon/) & supports FSDP.
 
 ## Usage
 Requires PyTorch >= 2.6. [Triton](https://triton-lang.org/main/index.html) is optional but provides a decent speed boost.
@@ -14,10 +14,12 @@ optimizer = THORN([
 		'params': [p for p in model.parameters() if p.ndim >= 2 and p.requires_grad],
 		'lr': 0.001,
 		'betas': (0.95, 0.95), # First- and second-order momentum betas
-		'gram': False, # Slower when enabled but might be a little better
-		'nesterov': True, # Best not to touch
-		'ns_steps': 5,    # Best not to touch
-		'none_grad': True # Automatically performs `zero_grad(set_to_none=True)` after each step.
+		'none_grad': True, # Automatically performs `zero_grad(set_to_none=True)` after each step.
+		'nesterov': True,  # Best not to touch
+		'iters': 5,        # Best not to touch
+		'lower_bound': 1e-3, # Lower bound of singular value, probably don't touch
+		'safety_factor': 0.02, # For numerical stability when computing coefficients
+		'cushion': 0.02
 	},
 	{
 		'orthogonalize': False,
@@ -69,5 +71,6 @@ for item in dataset:
 - Liang, K., Chen, L., Liu, B., & Liu, Q. (2025). [*Cautious Optimizers: Improving Training with One Line of Code.*](http://arxiv.org/abs/2411.16085)
 - Pudipeddi, B., Mesmakhosroshahi, M., Xi, J., & Bharadwaj, S. (2020). [*Training Large Neural Networks with Constant Memory using a New Execution Algorithm.*](http://arxiv.org/abs/2002.05645)
 - Chen, L., Li, J., Liang, K., Su, B., Xie, C., Pierse, N. W., … Liu, Q. (2025). [*Cautious Weight Decay.*](http://arxiv.org/abs/2510.12402)
+- Amsel, N., Persson, D., Musco, C., & Gower, R. M. (2025). [*The Polar Express: Optimal Matrix Sign Methods and Their Application to the Muon Algorithm.*](http://arxiv.org/abs/2505.16932)
 - [Flash-Muon](https://github.com/nil0x9/flash-muon) by Tianyang Lin
 - [optimī](https://github.com/warner-benjamin/optimi) by Benjamin Warner
