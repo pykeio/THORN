@@ -294,7 +294,10 @@ def _apply_param_update(
 	weight_decay: float,
 	scale: float = 1.
 ):
-	p.data.mul_(1. - lr * weight_decay)
+	if weight_decay > 0.0:
+		# "Cautious" weight decay (https://arxiv.org/abs/2510.12402)
+		mask = (update * p) >= 0
+		update.addcmul_(p, (weight_decay * mask).to(dtype=p.dtype))
 	p.data.add_(update, alpha=-lr / scale)
 
 @torch.no_grad()

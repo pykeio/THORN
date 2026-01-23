@@ -68,5 +68,6 @@ for item in dataset:
 - Liu, J., Su, J., Yao, X., Jiang, Z., Lai, G., Du, Y., … Yang, Z. (2025). [*Muon is Scalable for LLM Training.*](http://arxiv.org/abs/2502.16982)
 - Liang, K., Chen, L., Liu, B., & Liu, Q. (2025). [*Cautious Optimizers: Improving Training with One Line of Code.*](http://arxiv.org/abs/2411.16085)
 - Pudipeddi, B., Mesmakhosroshahi, M., Xi, J., & Bharadwaj, S. (2020). [*Training Large Neural Networks with Constant Memory using a New Execution Algorithm.*](http://arxiv.org/abs/2002.05645)
+- Chen, L., Li, J., Liang, K., Su, B., Xie, C., Pierse, N. W., … Liu, Q. (2025). [*Cautious Weight Decay.*](http://arxiv.org/abs/2510.12402)
 - [Flash-Muon](https://github.com/nil0x9/flash-muon) by Tianyang Lin
 - [optimī](https://github.com/warner-benjamin/optimi) by Benjamin Warner
