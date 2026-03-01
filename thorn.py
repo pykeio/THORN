@@ -263,7 +263,7 @@ def _apply_per_neuron_norm(
 
 def _resize(g: torch.Tensor):
 	if g.ndim > 2: # for conv filters
-		g = g.view(g.size(0), -1).contiguous()
+		g = g.reshape(g.size(0), -1).contiguous()
 	return g
 
 @torch.no_grad()
@@ -754,9 +754,9 @@ class THORN(Optimizer):
 			if p is None or g is None:
 				continue
 
-			g = _resize(g)
 			state = self.state[p]
 			if ortho:
+				g = _resize(g)
 				if 'moment' not in state:
 					state['moment'] = torch.zeros_like(g)
 					state['variance'] = torch.zeros((g.shape[0], 1), dtype=g.dtype, device=g.device)
