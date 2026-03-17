@@ -10,11 +10,11 @@ It won't give the *best possible* results, but you can often reuse AdamW's same 
 <figure>
 <img src="docs/lm_loss.png" width="550" />
 
-<figcaption><sup>
+<figcaption>
 
 ~300M Qwen3-based character-level causal language model on a simple dataset. $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.99$, $\lambda=0.1$ for both THORN & AdamW
 
-</sup></figcaption>
+</figcaption>
 </figure>
 
 ## Usage
