@@ -1,0 +1,882 @@
+############################################################################
+# Copyright 2025-2026 pyke.io                                              #
+#                                                                          #
+# Licensed under the Apache License, Version 2.0 (the "License");          #
+# you may not use this file except in compliance with the License.         #
+# You may obtain a copy of the License at                                  #
+#                                                                          #
+#     http://www.apache.org/licenses/LICENSE-2.0                           #
+#                                                                          #
+# Unless required by applicable law or agreed to in writing, software      #
+# distributed under the License is distributed on an "AS IS" BASIS,        #
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. #
+# See the License for the specific language governing permissions and      #
+# limitations under the License.                                           #
+############################################################################
+
+from dataclasses import dataclass, field, fields, MISSING
+from functools import partial, lru_cache
+from os import environ
+from typing import cast, overload, Callable, Literal, Optional, TypedDict, Union, NotRequired
+
+import torch
+import torch.cuda as cuda
+import torch.distributed as dist
+from torch.distributed.tensor import DTensor, Replicate, Shard
+import torch.nn as nn
+from torch.nn import Parameter
+from torch.optim import Optimizer
+from torch.optim.optimizer import _get_value
+
+_has_triton = False
+try:
+	from triton.compiler.compiler import triton_key
+	_has_triton = triton_key is not None
+except ModuleNotFoundError:
+	pass
+except RuntimeError:
+	pass
+
+if _has_triton and environ.get('THORN_DISABLE_TRITON') != '1':
+	import triton
+	import triton.language as tl
+
+	_autotune_conf = [
+		triton.Config({'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k, 'GROUP_SIZE_M': grp_sz}, num_stages=n_stages, num_warps=n_warps)
+		for blk_m in [32, 64, 128]
+		for blk_k in [32, 64]
+		for grp_sz in [8]
+		for n_stages in [3, 4, 5]
+		for n_warps  in [4, 8]
+	]
+	@triton.autotune(configs=_autotune_conf, key=['M', 'K'])
+	@triton.jit
+	def _mmt_kernel(x, y, M, K, stride_xm, stride_xk, stride_ym, stride_yn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
+		"""
+		Kernel computing y = x @ x.T, exploiting the fact that this produces a symmetrical matrix. From https://github.com/nil0x9/flash-muon
+		"""
+
+		pid = tl.program_id(axis=0)
+		num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
+		num_pid_n = tl.cdiv(M, BLOCK_SIZE_M)
+		num_pid_in_group = GROUP_SIZE_M * num_pid_n
+		group_id = pid // num_pid_in_group
+		first_pid_m = group_id * GROUP_SIZE_M
+		group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
+		pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
+		pid_n = (pid % num_pid_in_group) // group_size_m
+		if pid_m > pid_n:
+			return
+
+		offs_xm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+		offs_xn = (pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+		offs_k = tl.arange(0, BLOCK_SIZE_K)
+		# we use a & b ptrs to denote different rows of x.
+		a_ptrs = x + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+		b_ptrs = x + (offs_xn[:, None] * stride_xm + offs_k[None, :] * stride_xk)
+
+		accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_M), dtype=tl.float32)
+
+		for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
+			a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+			b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
+			accumulator = tl.dot(a, tl.permute(b, (1, 0)), accumulator)
+			a_ptrs += BLOCK_SIZE_K * stride_xk
+			b_ptrs += BLOCK_SIZE_K * stride_xk
+		c = accumulator.to(x.dtype.element_ty)
+
+		offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+		offs_cn = pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+		c_ptrs = y + stride_ym * offs_cm[:, None] + stride_yn * offs_cn[None, :]
+		c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
+		tl.store(c_ptrs, c, mask=c_mask)
+
+		# transpose and copy
+		if pid_m < pid_n:
+			ct_ptrs = y + stride_ym * offs_cn[:, None] + stride_yn * offs_cm[None, :]
+			ct_mask = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
+			tl.store(ct_ptrs, tl.permute(c, (1,0)), mask=ct_mask)
+
+	@torch.no_grad()
+	def _mmt_assign(x: torch.Tensor, y: torch.Tensor):
+		assert x.is_cuda and y.is_cuda
+		assert x.device == y.device
+		assert x.dtype == y.dtype
+		assert x.ndim == 2 and y.ndim == 2
+		assert x.size(0) == y.size(0) == y.size(1)
+
+		x = x.contiguous()
+		M, K = x.shape
+		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(M, META['BLOCK_SIZE_M']),)
+		with torch.cuda.device(x.device.index):
+			_mmt_kernel[grid](x, y, M, K, x.stride(0), x.stride(1), y.stride(0), y.stride(1))
+else:
+	if not _has_triton:
+		import warnings
+		warnings.warn('Triton not found; using slow MMT path.')
+
+	@torch.no_grad()
+	def _mmt_assign(x: torch.Tensor, y: torch.Tensor):
+		torch.mm(x, x.mT, out=y)
+
+try:
+	if environ.get('THORN_COMPILE') != '1':
+		raise Exception()
+
+	@torch.compile(dynamic=False, fullgraph=True)
+	@torch.no_grad()
+	def test(x: torch.Tensor):
+		return x + 1.
+
+	x = test(torch.tensor([1.0, 2.0]).cuda())
+	assert torch.allclose(x.cpu(), torch.tensor([2.0, 3.0]))
+
+	del x
+	del test
+	_optional_compile = torch.compile # type: ignore
+except:
+	def _optional_compile(model: None = None, *, fullgraph: bool = False, dynamic: bool = False):
+		def fn(c):
+			return c
+		return fn
+
+@lru_cache(maxsize=None)
+def _optimal_composition(l: float, num_iters: int, safety_factor_eps: float = 0.0, cushion: float = 0.0):
+	"""
+	Calculate coefficients for `_polar_decomp`, from https://arxiv.org/pdf/2505.16932
+	"""
+	assert 0 <= l <= 1
+
+	def optimal_quintic(l: float, u: float):
+		assert 0 <= l <= u
+
+		eps_d = 1e-15
+		if l / u >= 1. - eps_d:
+			return (15. / 8.) / u, \
+				(-10. / 8.) / (u ** 3.), \
+				(3. / 8.) / (u ** 5.)
+
+		q = (3. * l + 1.) / 4.
+		r = (l + 3.) / 4.
+		E, old_E = float('inf'), None
+		a, b, c = 1., 1., 1.
+		while not old_E or abs(old_E - E) > eps_d:
+			old_E = E
+			LHS = torch.tensor([
+				[l, l ** 3., l ** 5.,  1.],
+				[q, q ** 3., q ** 5., -1.],
+				[r, r ** 3., r ** 5.,  1.],
+				[u, u ** 3., u ** 5., -1.],
+			], dtype=torch.double)
+			a, b, c, E = torch.linalg.solve(LHS, torch.ones(4, dtype=torch.double))
+			q, r = torch.sqrt((-3. * b + torch.tensor([-1., 1.], dtype=torch.double) * (9. * b ** 2. - 20. * a * c) ** 0.5) / (10. * c))
+		return float(a), float(b), float(c)
+
+	u = 1.
+	safety_factor = 1. + safety_factor_eps
+	coefficients = []
+	for iter in range(num_iters):
+		a, b, c = optimal_quintic(max(l, cushion * u), u)
+		if cushion * u > l:
+			pl = a * l + b * l ** 3. + c * l ** 5.
+			pu = a * u + b * u ** 3. + c * u ** 5.
+			rescaler = 2. / (pl + pu)
+			a *= rescaler
+			b *= rescaler
+			c *= rescaler
+
+		if iter < num_iters - 1:
+			a /= safety_factor
+			b /= safety_factor ** 3.
+			c /= safety_factor ** 5.
+
+		coefficients.append((a, b, c))
+
+		l = a * l + b * l ** 3. + c * l ** 5.
+		u = 2. - l
+
+	return coefficients
+
+@dataclass
+class _THORNParameterGroup:
+	orthogonalize: bool
+	params: list[Parameter]
+	lr: float
+	none_grad: bool = field(default=True)
+	eps: float = field(default=1e-8)
+	weight_decay: float = field(default=0.1)
+	betas: tuple[float, float] = field(default_factory=lambda: (0.95, 0.95))
+	iters: int = field(default=5)
+	rectify: bool = field(default=False)
+	target_rms: float = field(default=0.2)
+	lower_bound: float = field(default=1e-3)
+	safety_factor: float = field(default=0.02)
+	cushion: float = field(default=0.02)
+	coeffs: list[tuple[float, float, float]] = field(init=False)
+
+	@classmethod
+	def from_kwargs(cls, **kwargs: dict) -> '_THORNParameterGroup':
+		return cls(**{k: kwargs[k] for k in kwargs if k in cls.__dataclass_fields__}) # type: ignore
+
+	def __post_init__(self):
+		if self.lr < 0.0:
+			raise ValueError(f'Invalid learning rate `{self.lr}`; should be >= 0')
+		if not (0.0 <= self.betas[0] < 1.0):
+			raise ValueError(f'Invalid beta1 `{self.betas[0]}`; should be in [0, 1)')
+		if not (0.0 <= self.betas[1] < 1.0):
+			raise ValueError(f'Invalid beta2 `{self.betas[1]}`; should be in [0, 1)')
+
+		self.coeffs = _optimal_composition(
+			l=self.lower_bound,
+			num_iters=self.iters,
+			safety_factor_eps=self.safety_factor,
+			cushion=self.cushion
+		)
+
+def _resize(g: torch.Tensor):
+	if g.ndim > 2: # for conv filters
+		g = g.reshape(g.size(0), -1).contiguous()
+	return g
+
+@_optional_compile(dynamic=False, fullgraph=True)
+@torch.no_grad()
+def _polar_decomp(G: torch.Tensor, group: _THORNParameterGroup):
+	X = G
+	if G.size(-2) > G.size(-1):
+		X = X.mT
+
+	# Ensure spectral norm is at most 1
+	X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1. + group.safety_factor) + group.eps)
+
+	X = X.contiguous()
+	A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
+	AA = torch.empty_like(A)
+	B = torch.empty_like(A)
+	C = torch.empty_like(X)
+
+	is_large_matrix = G.size(-2) > 1024 or G.size(-1) > 1024
+	_mm = torch.bmm if X.ndim > 2 else torch.mm
+	_addmm = torch.baddbmm if X.ndim > 2 else torch.addmm
+
+	for (a, b, c) in group.coeffs[:group.iters]:
+		_mmt_assign(X, A) # A = X @ X.mT
+		_mmt_assign(A, AA) # AA = A @ A.mT - note that AA = AA^T because A is symmetrical.
+		A.mul_(b) # A = b * A
+		torch.add(A, AA, alpha=c, out=B) # B = A + c * AA
+
+		if is_large_matrix:
+			_mm(B, X, out=C) # C = B @ X
+			C.add_(X, alpha=a) # C = C + a * X
+		else:
+			_addmm(X, B, X, beta=a, out=C) # C = a * X + B @ X
+
+		X, C = C, X
+
+	if G.size(-2) > G.size(-1):
+		X = X.mT
+
+	return X
+
+@torch.no_grad()
+def _per_neuron_norm(u: torch.Tensor, m2: torch.Tensor | None, group: _THORNParameterGroup):
+	# Per-neuron normalization, from https://arxiv.org/abs/2510.05491
+	if group.betas[1] > 0:
+		assert m2 is not None, 'beta2 cannot be enabled mid-run'
+		v_norm = u.norm(dim=(-2, -1), keepdim=True)
+		v_mean = u.square().mean(dim=-1, keepdim=True)
+		m2.lerp_(v_mean.to(m2.dtype), 1. - group.betas[1])
+		u.mul_(m2.clamp_min(group.eps).rsqrt_())
+		v_norm_new = u.norm(dim=(-2, -1), keepdim=True)
+		u.mul_(v_norm.div_(v_norm_new.clamp_min_(group.eps)))
+	return u
+
+@torch.no_grad()
+def _weight_decay(
+	p: torch.Tensor,
+	update: torch.Tensor,
+	weight_decay: float
+):
+	# "Cautious" weight decay; only apply weight decay to elements in the same direction as the update
+	# https://arxiv.org/abs/2510.12402
+	if weight_decay > 0.0:
+		mask = ((update * p) >= 0).to(dtype=p.dtype)
+		update.addcmul_(p, mask.mul_(weight_decay))
+	return update
+
+def _lr_scale_ortho(p: torch.Tensor, target_rms: float = 0.2):
+	if target_rms != 0.0:
+		# Scale LR to match RMS update of AdamW so AdamW's LR can be reused
+		# per formula 4 of https://arxiv.org/pdf/2502.16982
+		return target_rms * (max(p.shape[:2]) ** 0.5)
+	else:
+		# Match original behavior of Jordan et al
+		return max(1, p.size(-2) / p.size(-1)) ** 0.5
+
+@torch.no_grad()
+def _compute_rect(group: _THORNParameterGroup, step: float | int):
+	"""
+	Compute variance rectification term, from RAdam: https://arxiv.org/abs/1908.03265
+	"""
+	beta2 = group.betas[1]
+
+	if beta2 > 0.0:
+		rho_inf = 2 / (1 - beta2) - 1
+		rho = rho_inf - 2 * step * (beta2 ** step) / (1 - beta2 ** step)
+		return (
+			((rho - 4) * (rho - 2) * rho_inf / ((rho_inf - 4) * (rho_inf - 2) * rho)) ** 0.5
+			if rho > 4.0
+			else 0.0
+		) ** float(group.rectify)
+	else:
+		return 1.0
+
+@dataclass
+class _DistributedTHORNState:
+	worker_rank: int
+	process_group: dist.ProcessGroup
+	gathered_grad: Optional[torch.Tensor] = None
+	scattered_u: Optional[torch.Tensor] = None
+	computed_u: Optional[torch.Tensor] = None
+	gather_event: Optional[torch.Event] = None
+	scatter_event: Optional[torch.Event] = None
+	compute_event: Optional[torch.Event] = None
+
+	@staticmethod
+	def _calc_flops(G: torch.Tensor, steps: int) -> int:
+		M, N = G.size(-2), G.size(-1)
+		if M > N:
+			M, N = N, M
+
+		return steps * ((M ** 3) * 2 + (M ** 2 * N) * 4 + M * N * 2 + M ** 2 * 3)
+
+	@staticmethod
+	def _get_shard_mesh(p: DTensor, rank: int) -> tuple[torch.Tensor, dist.ProcessGroup]:
+		assert isinstance(p, DTensor)
+
+		if p.placements == (Shard(dim=0),):
+			return p.device_mesh.mesh, p.device_mesh.get_group(mesh_dim=0)
+		elif p.placements == (Replicate(), Shard(dim=0)):
+			for shard_mesh in p.device_mesh.mesh:
+				if rank in shard_mesh:
+					return shard_mesh, p.device_mesh.get_group(mesh_dim=1)
+			raise ValueError('shouldn\'t happen')
+		else:
+			raise ValueError(f'Unsupported placements {p.placements}')
+
+	@torch.no_grad()
+	def gather(
+		self,
+		p: DTensor,
+		group: _THORNParameterGroup,
+		rank: int,
+		comm_stream: cuda.Stream
+	):
+		with cuda.stream(comm_stream):
+			assert p.grad is not None
+			g = cast(DTensor, _resize(p.grad).to(dtype=torch.float32))
+			gather_list = [
+				torch.empty_like(g.to_local(), dtype=torch.float32)
+				for _ in range(dist.get_world_size(group=self.process_group))
+			] if rank == self.worker_rank else None
+			dist.gather(
+				g.to_local(),
+				dst=self.worker_rank,
+				gather_list=gather_list,
+				group=self.process_group
+			)
+			if rank == self.worker_rank:
+				if self.gathered_grad is not None:
+					raise RuntimeError('Gather event already exists, which should not happen.')
+				self.gathered_grad = torch.cat(gather_list, dim=0)
+				self.gather_event = cast(torch.Event, cuda.Event())
+				self.gather_event.record()
+			else:
+				self.gathered_grad = None
+				self.gather_event = None
+
+			gather_list = None
+			if group.none_grad:
+				# We can safely free p.grad without calling record_stream:
+				#   p.grad.to_local().record_stream(comm_stream)
+				# Explanation:
+				# 1. p.grad is created on the default stream, but the default stream
+				#    is synchronized with the comm stream later.
+				# 2. There is no further activity on the default stream before the optimizer finishes.
+				# Therefore, it is safe to free p.grad directly on the comm stream.
+				p.grad = None
+
+	@torch.no_grad()
+	def compute_u(
+		self,
+		p: DTensor,
+		m2: torch.Tensor | None,
+		group: _THORNParameterGroup,
+		rank: int,
+		compute_stream: cuda.Stream
+	):
+		with cuda.stream(compute_stream):
+			if rank == self.worker_rank:
+				if self.gather_event is None:
+					raise RuntimeError('Gather event must be set before compute.')
+
+				compute_stream.wait_event(self.gather_event)
+				assert self.gathered_grad is not None
+
+				u = _polar_decomp(self.gathered_grad, group)
+				u = _per_neuron_norm(u, m2, group)
+
+				self.computed_u = u
+
+			self.scattered_u = torch.empty_like(_resize(p.to_local()), dtype=torch.float32) # type: ignore
+			self.compute_event = cast(torch.Event, cuda.Event())
+			self.compute_event.record()
+			u = None
+
+	@torch.no_grad()
+	def scatter(
+		self,
+		p: DTensor,
+		rank: int,
+		comm_stream: cuda.Stream
+	):
+		with cuda.stream(comm_stream):
+			if self.compute_event is None:
+				raise RuntimeError('Compute event must be set before scatter.')
+			comm_stream.wait_event(self.compute_event)
+
+			if rank == self.worker_rank:
+				num_ranks = dist.get_world_size(group=self.process_group)
+
+				# Clear the gathered gradient to free memory
+				self.gathered_grad = None
+
+				u = self.computed_u
+				assert u is not None
+				scatter_list = list(torch.split(u, p.size(0) // num_ranks, dim=0))
+				scatter_list = [s.contiguous() for s in scatter_list]
+			else:
+				scatter_list = None
+
+			torch.distributed.scatter(
+				self.scattered_u, # type: ignore
+				scatter_list=scatter_list,
+				src=self.worker_rank,
+				group=self.process_group
+			)
+
+			self.scatter_event = cast(torch.Event, torch.cuda.Event())
+			self.scatter_event.record()
+			scatter_list = None
+
+	def update_param(
+		self,
+		p: DTensor,
+		group: _THORNParameterGroup,
+		step: int,
+		rank: int,
+		compute_stream: cuda.Stream
+	):
+		with torch.cuda.stream(compute_stream):
+			if self.scatter_event is None:
+				raise RuntimeError('Scatter event must be set before update')
+
+			compute_stream.wait_event(self.scatter_event)
+			assert self.scattered_u is not None
+			u_dtensor = DTensor.from_local(self.scattered_u, placements=p.placements, device_mesh=p.device_mesh)
+			self.scattered_u = u_dtensor
+			if rank == self.worker_rank:
+				self.computed_u = None
+
+			u = self.scattered_u.view_as(p)
+			u = _weight_decay(p, u, group.weight_decay)
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, step))
+
+			self.scattered_u = None
+			u_dtensor = None
+
+class THORNOrthogonalizedParameterGroup(TypedDict, total=True):
+	orthogonalize: Literal[True]
+	params: list[Parameter]
+	lr: NotRequired[float]
+	betas: NotRequired[tuple[float, float]]
+	weight_decay: NotRequired[float]
+	iters: NotRequired[int]
+	eps: NotRequired[float]
+	none_grad: NotRequired[bool]
+	lower_bound: NotRequired[float]
+	safety_factor: NotRequired[float]
+	cushion: NotRequired[float]
+	target_rms: NotRequired[float]
+	rectify: NotRequired[bool]
+	coeffs: NotRequired[list[tuple[float, float, float]]]
+
+class THORNNonOrthogonalizedParameterGroup(TypedDict, total=True):
+	orthogonalize: Literal[False]
+	params: list[Parameter]
+	lr: NotRequired[float]
+	betas: NotRequired[tuple[float, float]]
+	weight_decay: NotRequired[float]
+	eps: NotRequired[float]
+	rectify: NotRequired[bool]
+	none_grad: NotRequired[bool]
+
+THORNParameterGroup = Union[THORNOrthogonalizedParameterGroup, THORNNonOrthogonalizedParameterGroup]
+
+class THORN(Optimizer):
+	param_groups: list[dict]
+	is_distributed: bool
+	rank: int | None = None
+	comm_stream = cuda.Stream()
+	compute_stream = cuda.Stream()
+
+	@overload
+	def __init__(
+		self,
+		module: nn.Module,
+		lr: float,
+		*,
+		none_grad: bool = True,
+		eps: float = 1e-8,
+		weight_decay: float = 0.1,
+		betas: tuple[float, float] = (0.95, 0.95),
+		iters: int = 5,
+		rectify: bool = False,
+		lower_bound: float = 1e-3,
+		safety_factor: float = 0.02,
+		cushion: float = 0.02,
+		gradient_release: bool = False
+	):
+		...
+
+	@overload
+	def __init__(self, param_groups: list[THORNParameterGroup]):
+		...
+
+	def __init__(self, val, **conf):
+		self._update_rate = 1
+
+		param_groups = THORN._auto_assign(val, **conf) if isinstance(val, nn.Module) else cast(list[THORNParameterGroup], val)
+		for group in param_groups:
+			assert 'orthogonalize' in group
+			if group['orthogonalize']:
+				assert all(map(lambda x: x.ndim >= 2, group['params'])), 'Only parameters with ndim >= 2 can be orthogonalized'
+
+		self.is_distributed = dist.is_initialized()
+		if self.is_distributed:
+			self.rank = dist.get_rank()
+
+		defaults = dict()
+		for field in fields(_THORNParameterGroup):
+			if field.default is not MISSING:
+				defaults[field.name] = field.default
+			elif field.default_factory is not MISSING:
+				defaults[field.name] = field.default_factory()
+
+		super().__init__(cast(list[dict], param_groups), defaults)
+
+		for group in self.param_groups:
+			for p in group['params']:
+				self.state[p]['group'] = group
+
+		if isinstance(val, nn.Module) and conf.get('gradient_release', False):
+			self.setup_gradient_release(val)
+
+	@staticmethod
+	def _auto_assign(module: nn.Module, **keys) -> list[THORNParameterGroup]:
+		embedding_params = []
+		def filter_embeddings(module: nn.Module):
+			if isinstance(module, nn.Embedding):
+				embedding_params.append(id(module.weight))
+		module.apply(filter_embeddings)
+
+		ortho_params = []
+		regular_params = []
+		for name, param in module.named_parameters():
+			if param.ndim >= 2 \
+				and 'lm_head' not in name \
+				and id(param) not in embedding_params:
+				ortho_params.append(param)
+			else:
+				regular_params.append(param)
+
+		return [
+			{
+				'orthogonalize': True,
+				'params': ortho_params,
+				**keys
+			},
+			{
+				'orthogonalize': False,
+				'params': regular_params,
+				**keys
+			}
+		]
+
+	def _assign_params(self, params: list[DTensor], group: _THORNParameterGroup):
+		assert self.rank is not None
+
+		param_to_state: dict[int, _DistributedTHORNState] = {}
+		param_to_flops: dict[int, int] = {}
+
+		for p in params:
+			g = p.grad
+			if g is None:
+				continue
+
+			g = _resize(g)
+
+			flops = _DistributedTHORNState._calc_flops(g, group.iters)
+			param_to_flops[id(p)] = flops
+
+		ordered_params = sorted(params, key=lambda p: param_to_flops[id(p)], reverse=True)
+
+		round_robin = 0
+		mesh = None
+		shard_mesh = None
+		process_group = None
+		for p in ordered_params:
+			if mesh is None:
+				mesh = p.device_mesh
+				shard_mesh, process_group = _DistributedTHORNState._get_shard_mesh(p, self.rank)
+			elif mesh != p.device_mesh:
+				raise ValueError('All parameters must be on the same mesh.')
+
+			assert shard_mesh is not None and process_group is not None
+
+			param_to_state[id(p)] = _DistributedTHORNState(
+				worker_rank=int(shard_mesh[round_robin].item()),
+				process_group=process_group
+			)
+
+			round_robin = (round_robin + 1) % len(shard_mesh)
+
+		return param_to_state, ordered_params
+
+	@torch.no_grad()
+	def _update_momentum(self, p: torch.Tensor, g: torch.Tensor, group: _THORNParameterGroup):
+		state = self.state[p]
+		momentum, beta1 = state['moment'], group.betas[0]
+		momentum.mul_(beta1).add_(g)
+		return g.add(momentum, alpha=beta1)
+
+	def _base_ortho_step(self, p: Parameter, group: _THORNParameterGroup):
+		assert p.grad is not None
+		state = self.state[p]
+		g = _resize(p.grad)
+
+		u = self._update_momentum(p, g, group)
+		if (int(state['step'].item()) + 1) % self._update_rate == 0:
+			u = _polar_decomp(u, group).to(dtype=p.dtype)
+			u = _per_neuron_norm(u, state['moment2'], group)
+			u = _weight_decay(p, u.view_as(p), group.weight_decay)
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, state['step'].item()))
+
+		if group.none_grad:
+			del g
+			p.grad = None
+
+	def _sharded_ortho_step(self, params: list[DTensor], group: _THORNParameterGroup):
+		update_params = []
+		for p in params:
+			g = p.grad
+			if g is None:
+				continue
+
+			g = _resize(g)
+			g = self._update_momentum(p, g, group)
+			if (int(self.state[p]['step'].item()) + 1) % self._update_rate == 0:
+				p.grad = g.view_as(p)
+				update_params.append(p)
+			else:
+				del g
+				p.grad = None
+
+		param_to_state, ordered_params = self._assign_params(params, group)
+
+		def enqueue_gathers(start_idx: int, chunk_size: int):
+			assert self.rank is not None
+			for p in ordered_params[start_idx:start_idx + chunk_size]:
+				state = param_to_state[id(p)]
+				state.gather(p, group, self.rank, self.comm_stream)
+
+		def enqueue_computes(start_idx: int, chunk_size: int):
+			assert self.rank is not None
+			for p in ordered_params[start_idx:start_idx + chunk_size]:
+				state = param_to_state[id(p)]
+				state.compute_u(
+					p,
+					self.state[p].get('moment2'),
+					group,
+					rank=self.rank,
+					compute_stream=self.compute_stream
+				)
+
+		def enqueue_scatters(start_idx: int, chunk_size: int):
+			assert self.rank is not None
+			for p in ordered_params[start_idx:start_idx + chunk_size]:
+				state = param_to_state[id(p)]
+				state.scatter(p, self.rank, self.comm_stream)
+
+		def enqueue_updates(start_idx: int, chunk_size: int):
+			assert self.rank is not None
+			for p in ordered_params[start_idx:start_idx + chunk_size]:
+				state = param_to_state[id(p)]
+				state.update_param(
+					p,
+					group,
+					step=self.state[p]['step'].item(),
+					rank=self.rank,
+					compute_stream=self.compute_stream
+				)
+				self.state[p]['step'] += 1
+
+		chunk_size = dist.get_world_size(param_to_state[id(params[0])].process_group)
+
+		self.comm_stream.wait_stream(cuda.current_stream())
+
+		i = 0
+		enqueue_gathers(0, chunk_size)
+		for i in range(0, len(params) + chunk_size - 1, chunk_size):
+			enqueue_computes(i, chunk_size)
+			if i > 0:
+				enqueue_updates(i - chunk_size, chunk_size)
+			enqueue_gathers(i + chunk_size, chunk_size)
+			enqueue_scatters(i, chunk_size)
+		enqueue_updates(i, chunk_size)
+
+		cuda.current_stream().wait_stream(self.compute_stream)
+
+	def _step_params(self, params: list[torch.nn.Parameter], group: _THORNParameterGroup):
+		distributed_params = []
+		regular_params = []
+		for p in params:
+			g = p.grad
+			if p is None or g is None:
+				continue
+
+			state = self.state[p]
+			if 'step' not in state:
+				state['step'] = torch.ones((), device=g.device)
+				if group.orthogonalize:
+					g = _resize(g)
+					state['moment'] = torch.zeros_like(g)
+					state['moment2'] = torch.zeros((g.shape[0], 1), dtype=g.dtype, device=g.device)
+				else:
+					state['z'] = torch.clone(p, memory_format=torch.preserve_format)
+					state['variance'] = torch.zeros_like(g)
+
+			if isinstance(p.data, DTensor):
+				if all(isinstance(placement, Replicate) for placement in cast(DTensor, p).placements) or not group.orthogonalize:
+					regular_params.append(p)
+				else:
+					distributed_params.append(p)
+			else:
+				regular_params.append(p)
+
+		if len(distributed_params) > 0:
+			self._sharded_ortho_step(distributed_params, group)
+
+		for p in regular_params:
+			state = self.state[p]
+			if group.orthogonalize:
+				self._base_ortho_step(p, group)
+			else:
+				g = p.grad
+
+				step = state['step'].item()
+				beta1, beta2 = group.betas
+
+				rect = _compute_rect(group, step)
+				lr = group.lr * rect
+				lr_max = state['lr_max'] = max(lr, state.get('lr_max', 0))
+
+				w = lr_max ** 2.0
+				w_sum = state['w_sum'] = state.get('w_sum', 0) + w
+				c_t = w / w_sum if w_sum > 0 else 0
+
+				z = state['z']
+				variance = state['variance']
+
+				variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+				if rect > 0.0:
+					denom = variance.div(1 - beta2 ** step).sqrt_().add_(group.eps)
+					u = g.div_(denom)
+				else:
+					u = g
+
+				should_update = (int(state['step'].item()) + 1) % self._update_rate == 0
+				if should_update:
+					u = _weight_decay(p, u, group.weight_decay)
+
+				# Schedule-free update: http://arxiv.org/abs/2405.15682
+				z.sub_(u, alpha=lr)
+				if should_update:
+					p.lerp_(end=z, weight=c_t)
+					p.add_(u, alpha=lr * (beta1 * (1 - c_t) - 1))
+
+				if group.none_grad:
+					del g
+					p.grad = None
+
+			state['step'] += 1
+
+	@torch.no_grad()
+	def eval(self):
+		for group in self.param_groups:
+			for p in group['params']:
+				state = self.state[p]
+				if 'z' in state:
+					p.lerp_(end=state['z'].to(p.device), weight=1 - 1 / group['betas'][0])
+
+	@torch.no_grad()
+	def train(self):
+		for group in self.param_groups:
+			for p in group['params']:
+				state = self.state[p]
+				if 'z' in state:
+					p.lerp_(end=state['z'].to(p.device), weight=1 - group['betas'][0])
+
+	@overload
+	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: None = None) -> None: ...
+	@overload
+	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: Callable[[], float]) -> float: ...
+	@torch.no_grad()
+	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: Optional[Callable[[], float]] = None) -> Optional[float]: # type: ignore
+		loss = None
+		if closure is not None:
+			with torch.enable_grad():
+				loss = closure()
+
+		if param is None:
+			for group in self.param_groups:
+				params = group['params']
+				self._step_params(params, _THORNParameterGroup.from_kwargs(**group))
+		else:
+			state = self.state[param]
+			group = _THORNParameterGroup.from_kwargs(**state['group'])
+			self._step_params([param], group)
+
+		return loss
+
+	def setup_gradient_release(
+		self,
+		model: nn.Module,
+		update_rate: int = 1,
+		ignore_existing_hooks: bool = False
+	):
+		def _gradient_release_hook(param: torch.Tensor, optimizer: THORN):
+			optimizer.step(param=cast(Parameter, param))
+			param.grad = None
+
+		hooks = []
+		for p in model.parameters():
+			if p.requires_grad:
+				if p._post_accumulate_grad_hooks is not None and len(p._post_accumulate_grad_hooks) > 0 and not ignore_existing_hooks:
+					for hook in hooks:
+						if hasattr(hook, 'remove'):
+							hook.remove()
+					raise ValueError('Model already has post_accumulate_grad_hooks. If this is expected, pass `ignore_existing_hooks=True`.')
+				hooks.append(p.register_post_accumulate_grad_hook(partial(_gradient_release_hook, optimizer=self)))
+		model._gradient_release_hooks = hooks # type: ignore
+
+		self._update_rate = update_rate
