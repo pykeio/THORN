@@ -7,15 +7,14 @@ THORN works on any model, but it's most effective for models with lots of convol
 
 It won't give the *best possible* results, but you can often reuse AdamW's same LR/betas/weight decay with THORN, making it effectively a free accuracy boost:
 
-<figure>
+<blockquote><figure>
 <img src="docs/lm_loss.png" width="550" />
-
-<figcaption>
+<figcaption><i>
 
 ~300M Qwen3-based character-level causal language model on a simple dataset. $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.99$, $\lambda=0.1$ for both THORN & AdamW
 
-</figcaption>
-</figure>
+</i></figcaption>
+</figure></blockquote>
 
 ## Usage
 *Requires* Python ≥ 3.12, PyTorch ≥ 2.6. [Triton](https://triton-lang.org/main/index.html) is optional but provides a decent speed boost. FSDP is supported & optimized for.
@@ -59,7 +58,7 @@ optim = THORN([
 ```
 
 $\beta_1$ and $\beta_2$ work differently from Adam:
-- **For orthogonalized parameters**: $\beta_1$ is the SGD momentum $\alpha$, like Muon's `momentum` parameter, and is often $0.9$–$0.95$. $\beta_2$ is NorMuon's `beta2` and is typically set to $0.95$. $\beta_2$ can also be set to $0$ to disable NorMuon entirely, saving memory.
+- **For orthogonalized parameters**: $\beta_1$ is the SGD momentum $\alpha$, like Muon's `momentum` parameter, and is often $0.9–0.95$. $\beta_2$ is NorMuon's `beta2` and is typically set to $0.95$. $\beta_2$ can also be set to $0$ to disable NorMuon entirely, saving memory.
 - **For non-orthogonalized parameters**: $\beta_1$ controls the proportion between Polyak-Ruppert averaging ($0$) and Primal averaging ($1$), since it actually implements [schedule-free][sf] Adam. $\approx0.9$ often works well, but longer training runs might want to use $0.95$ or $0.98$. $\beta_2$ behaves the same as in Adam.
 
 `weight_decay` ($\lambda$) is actually [cautious weight decay][cwd], so you should set it a bit higher than you normally would. $\approx0.1$ often works well.
@@ -67,7 +66,7 @@ $\beta_1$ and $\beta_2$ work differently from Adam:
 There are a few more knobs you can tune besides the usual:
 - `none_grad` (`bool`, default `True`) automatically sets gradients to `None` after the optimizer completes an update.
 - `rectify` (`bool`, default `False`) applies the variance rectification term from [RAdam][radam]. This achieves the same effect as LR warmup, slowing updates very early in training to allow the momentum buffers to settle.
-- `target_rms` (`float`, default `0.2`): The LR for orthogonalized layers is scaled so the RMS update roughly matches that of Adam, so Adam's LR can be reused. Adam's RMS update is often between $0.2$–$0.4$. This can also be set to $0$ to match the LR scaling of *Jordan et al*, so vanilla Muon's LR can be reused instead.
+- `target_rms` (`float`, default `0.2`): The LR for orthogonalized layers is scaled so the RMS update roughly matches that of Adam, so Adam's LR can be reused. Adam's RMS update is often between $0.2–0.4$. This can also be set to $0$ to match the LR scaling of *Jordan et al*, so vanilla Muon's LR can be reused instead.
 
 It's normal for THORN to start out learning slower than Adam in the early stages of training before picking up and quickly surpassing Adam.
 
