@@ -71,7 +71,7 @@ There are a few more knobs you can tune besides the usual:
 It's normal for THORN to start out learning slower than Adam in the early stages of training before picking up and quickly surpassing Adam.
 
 ## Optional features
-If Triton is installed, THORN will use a custom kernel to compute $A=XX^\top$ to speed up computation on larger matrix parameters. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable this.
+If Triton is installed, THORN will use a custom kernel to speed up computation on larger matrix parameters by up to 50%. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable it if problems arise.
 
 The `THORN_COMPILE` environment variable can be set to `1` to use `torch.compile` for a slight speed boost. This is broken on Windows, so it's disabled by default.
 
@@ -119,6 +119,7 @@ With the gradient accumulation approximation (`update_rate` $\gt 1$), the *optim
 - Defazio, A., Yang, X. A., Mehta, H., Mishchenko, K., Khaled, A., & Cutkosky, A. (2024). [*The Road Less Scheduled.*][sf]
 - Liu, L., Jiang, H., He, P., Chen, W., Liu, X., Gao, J., & Han, J. (2021). [*On the Variance of the Adaptive Learning Rate and Beyond.*][radam]
 - Zhang, Y., Han, Y., Cao, S., Dai, G., Miao, Y., Cao, T., … Xu, N. (2023). [*Adam Accumulation to Reduce Memory Footprints of both Activations and Gradients for Large-scale DNN Training.*](http://arxiv.org/abs/2305.19982)
+- Zhang, J., Amsel, N., Chen, B., & Dao, T. (2026). [*Gram Newton-Schulz.*](https://dao-ailab.github.io/blog/2026/gram-newton-schulz/)
 - [Flash-Muon](https://github.com/nil0x9/flash-muon) by Tianyang Lin
 - [optimī](https://github.com/warner-benjamin/optimi) by Benjamin Warner
 

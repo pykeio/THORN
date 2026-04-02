@@ -16,6 +16,7 @@
 
 from dataclasses import dataclass, field, fields, MISSING
 from functools import partial, lru_cache
+from itertools import combinations
 from os import environ
 from typing import cast, overload, Callable, Literal, Optional, TypedDict, Union, NotRequired
 
@@ -30,32 +31,45 @@ from torch.optim.optimizer import _get_value
 
 _has_triton = False
 try:
-	from triton.compiler.compiler import triton_key
-	_has_triton = triton_key is not None
+	import triton # ty:ignore[unresolved-import]
+	_has_triton = True
 except ModuleNotFoundError:
 	pass
 except RuntimeError:
 	pass
 
-if _has_triton and environ.get('THORN_DISABLE_TRITON') != '1':
-	import triton
-	import triton.language as tl
+_use_triton = _has_triton and environ.get('THORN_DISABLE_TRITON') != '1'
+if _use_triton:
+	import triton                # ty:ignore[unresolved-import]
+	import triton.language as tl # ty:ignore[unresolved-import]
 
 	_autotune_conf = [
-		triton.Config({'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k, 'GROUP_SIZE_M': grp_sz}, num_stages=n_stages, num_warps=n_warps)
-		for blk_m in [32, 64, 128]
-		for blk_k in [32, 64]
-		for grp_sz in [8]
+		triton.Config(
+			{'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k, 'GROUP_SIZE_M': grp_sz},
+			num_stages=n_stages, num_warps=n_warps,
+		)
+		for blk_m    in [32, 64, 128]
+		for blk_k    in [32, 64]
+		for grp_sz   in [8]
 		for n_stages in [3, 4, 5]
 		for n_warps  in [4, 8]
 	]
+
 	@triton.autotune(configs=_autotune_conf, key=['M', 'K'])
 	@triton.jit
-	def _mmt_kernel(x, y, M, K, stride_xm, stride_xk, stride_ym, stride_yn, BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_K: tl.constexpr, GROUP_SIZE_M: tl.constexpr):
-		"""
-		Kernel computing y = x @ x.T, exploiting the fact that this produces a symmetrical matrix. From https://github.com/nil0x9/flash-muon
-		"""
-
+	def _sym_addmm_kernel(
+		A, B, C, O,
+		alpha, beta,
+		M, K,
+		stride_am, stride_ak,
+		stride_bk, stride_bn,
+		stride_cm, stride_cn,
+		stride_om, stride_on,
+		BLOCK_SIZE_M: tl.constexpr,
+		BLOCK_SIZE_K: tl.constexpr,
+		GROUP_SIZE_M: tl.constexpr,
+	):
+		# adapted from https://github.com/nil0x9/flash-muon
 		pid = tl.program_id(axis=0)
 		num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 		num_pid_n = tl.cdiv(M, BLOCK_SIZE_M)
@@ -65,59 +79,98 @@ if _has_triton and environ.get('THORN_DISABLE_TRITON') != '1':
 		group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
 		pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
 		pid_n = (pid % num_pid_in_group) // group_size_m
+
 		if pid_m > pid_n:
 			return
 
-		offs_xm = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
-		offs_xn = (pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+		offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
+		offs_n = (pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
 		offs_k = tl.arange(0, BLOCK_SIZE_K)
-		# we use a & b ptrs to denote different rows of x.
-		a_ptrs = x + (offs_xm[:, None] * stride_xm + offs_k[None, :] * stride_xk)
-		b_ptrs = x + (offs_xn[:, None] * stride_xm + offs_k[None, :] * stride_xk)
 
-		accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_M), dtype=tl.float32)
+		a_ptrs = A + (offs_m[:, None] * stride_am + offs_k[None, :] * stride_ak)
+		b_ptrs = B + (offs_k[:, None] * stride_bk + offs_n[None, :] * stride_bn)
+
+		acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_M), dtype=tl.float32)
 
 		for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-			a = tl.load(a_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-			b = tl.load(b_ptrs, mask=offs_k[None, :] < K - k * BLOCK_SIZE_K, other=0.0)
-			accumulator = tl.dot(a, tl.permute(b, (1, 0)), accumulator)
-			a_ptrs += BLOCK_SIZE_K * stride_xk
-			b_ptrs += BLOCK_SIZE_K * stride_xk
-		c = accumulator.to(x.dtype.element_ty)
+			mask_k = offs_k < K - k * BLOCK_SIZE_K
+			a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+			b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+			acc = tl.dot(a, b, acc)
+			a_ptrs += BLOCK_SIZE_K * stride_ak
+			b_ptrs += BLOCK_SIZE_K * stride_bk
 
-		offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-		offs_cn = pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
-		c_ptrs = y + stride_ym * offs_cm[:, None] + stride_yn * offs_cn[None, :]
-		c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < M)
-		tl.store(c_ptrs, c, mask=c_mask)
+		offs_om = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+		offs_on = pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
+		block_mask = (offs_om[:, None] < M) & (offs_on[None, :] < M)
 
-		# transpose and copy
+		c_ptrs = C + stride_cm * offs_om[:, None] + stride_cn * offs_on[None, :]
+		c = tl.load(c_ptrs, mask=block_mask, other=0.0).to(tl.float32)
+
+		o_ptrs = O + stride_om * offs_om[:, None] + stride_on * offs_on[None, :]
+		o = (alpha * acc + beta * c).to(A.dtype.element_ty)
+		tl.store(o_ptrs, o, mask=block_mask)
+
 		if pid_m < pid_n:
-			ct_ptrs = y + stride_ym * offs_cn[:, None] + stride_yn * offs_cm[None, :]
-			ct_mask = (offs_cn[:, None] < M) & (offs_cm[None, :] < M)
-			tl.store(ct_ptrs, tl.permute(c, (1,0)), mask=ct_mask)
+			ot_ptrs = O + stride_om * offs_on[:, None] + stride_on * offs_om[None, :]
+			ot_mask = (offs_on[:, None] < M) & (offs_om[None, :] < M)
+			tl.store(ot_ptrs, tl.permute(o, (1, 0)), mask=ot_mask)
+elif not _has_triton:
+	import warnings
+	warnings.warn('Triton is not installed, so THORN will fall back to non-symmetric matmul. Installing Triton can speed up optimizer.step() by up to 50%; the effect would be most notable on larger models.')
 
-	@torch.no_grad()
-	def _mmt_assign(x: torch.Tensor, y: torch.Tensor):
-		assert x.is_cuda and y.is_cuda
-		assert x.device == y.device
-		assert x.dtype == y.dtype
-		assert x.ndim == 2 and y.ndim == 2
-		assert x.size(0) == y.size(0) == y.size(1)
+@torch.no_grad()
+def _sym_addmm(
+	A: torch.Tensor,
+	B: torch.Tensor,
+	C: torch.Tensor,
+	alpha: float = 1.0,
+	beta: float = 1.0,
+	out: torch.Tensor | None = None,
+) -> torch.Tensor:
+	"""
+	out = beta * C + alpha * (A @ B), assuming A @ B and C are symmetrical
 
-		x = x.contiguous()
-		M, K = x.shape
-		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) * triton.cdiv(M, META['BLOCK_SIZE_M']),)
-		with torch.cuda.device(x.device.index):
-			_mmt_kernel[grid](x, y, M, K, x.stride(0), x.stride(1), y.stride(0), y.stride(1))
-else:
-	if not _has_triton:
-		import warnings
-		warnings.warn('Triton not found; using slow MMT path.')
+	A = (M, K), B = (K, M), C/out = (M, M)
+	"""
+	assert A.is_cuda and B.is_cuda and C.is_cuda
+	assert A.device == B.device == C.device
+	assert A.dtype == B.dtype == C.dtype
+	assert A.ndim == 2 and B.ndim == 2 and C.ndim == 2
 
-	@torch.no_grad()
-	def _mmt_assign(x: torch.Tensor, y: torch.Tensor):
-		torch.mm(x, x.mT, out=y)
+	M, K = A.shape
+	assert B.shape == (K, M), f"B must be ({K}, {M}), got {tuple(B.shape)}"
+	assert C.shape == (M, M), f"C must be ({M}, {M}), got {tuple(C.shape)}"
+
+	A = A.contiguous()
+	B = B.contiguous()
+	C = C.contiguous()
+
+	if out is not None:
+		assert out.shape == (M, M), f"out must be ({M}, {M}), got {tuple(out.shape)}"
+		assert out.dtype == A.dtype
+		assert out.device == A.device
+		O = out
+	elif _use_triton:
+		O = torch.empty((M, M), dtype=A.dtype, device=A.device)
+
+	if not _use_triton:
+		# torch.addmm doesn't support out == C like our kernel does, so we can't pass out here
+		O = torch.addmm(C, A, B, alpha=alpha, beta=beta)
+	else:
+		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) ** 2,)
+		with torch.cuda.device(A.device.index):
+			_sym_addmm_kernel[grid](
+				A, B, C, O,
+				alpha, beta,
+				M, K,
+				A.stride(0), A.stride(1),
+				B.stride(0), B.stride(1),
+				C.stride(0), C.stride(1),
+				O.stride(0), O.stride(1)
+			)
+
+	return O
 
 try:
 	if environ.get('THORN_COMPILE') != '1':
@@ -197,6 +250,40 @@ def _optimal_composition(l: float, num_iters: int, safety_factor_eps: float = 0.
 
 	return coefficients
 
+@lru_cache(maxsize=None)
+def _gram_ns_restarts(*coeffs: tuple[float, float, float]):
+	E = torch.logspace(0, -10, 10000, dtype=torch.float64)
+	K = -4e-4
+
+	def stability_cond(t: torch.Tensor):
+		min, max = t.aminmax()
+		return (max / min).item()
+
+	for num_restarts in range(1, len(coeffs)):
+		q_max = float('inf')
+		restarts = []
+		possible_positions = list(range(1, len(coeffs)))
+		for i, combo in enumerate(combinations(possible_positions, num_restarts)):
+			qv = []
+			e = E.clone()
+			for j, (a, b, c) in enumerate(coeffs):
+				if j == 0 or j in combo:
+					if j != 0:
+						e *= q
+					r = e ** 2 + K
+					q = torch.ones(len(e), dtype=torch.float64)
+				z = a + r * (b + r * c)
+				q *= z
+				r *= z ** 2
+				qv.append(q)
+			q = max([stability_cond(q) for q in qv])
+			if q < q_max:
+				q_max = q
+				restarts = list(combo)
+		if q_max < 1e8:
+			return restarts
+	raise ValueError('No stable restarts with these parameters')
+
 @dataclass
 class _THORNParameterGroup:
 	orthogonalize: bool
@@ -210,9 +297,10 @@ class _THORNParameterGroup:
 	rectify: bool = field(default=False)
 	target_rms: float = field(default=0.2)
 	lower_bound: float = field(default=1e-3)
-	safety_factor: float = field(default=0.02)
+	safety_factor: float = field(default=0.05)
 	cushion: float = field(default=0.02)
 	coeffs: list[tuple[float, float, float]] = field(init=False)
+	restarts: list[int] = field(init=False)
 
 	@classmethod
 	def from_kwargs(cls, **kwargs: dict) -> '_THORNParameterGroup':
@@ -232,6 +320,7 @@ class _THORNParameterGroup:
 			safety_factor_eps=self.safety_factor,
 			cushion=self.cushion
 		)
+		self.restarts = _gram_ns_restarts(*self.coeffs)
 
 def _resize(g: torch.Tensor):
 	if g.ndim > 2: # for conv filters
@@ -240,42 +329,33 @@ def _resize(g: torch.Tensor):
 
 @_optional_compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
-def _polar_decomp(G: torch.Tensor, group: _THORNParameterGroup):
-	X = G
-	if G.size(-2) > G.size(-1):
+def _polar_decomp(X: torch.Tensor, group: _THORNParameterGroup):
+	dtype = X.dtype
+	if should_transpose := X.size(-2) > X.size(-1):
 		X = X.mT
 
-	# Ensure spectral norm is at most 1
-	X = X / (X.norm(dim=(-2, -1), keepdim=True) * (1. + group.safety_factor) + group.eps)
+	X = X.to(torch.float32)
+	X /= X.norm(dim=(-2, -1), keepdim=True) + 1e-6
+	X = X.to(torch.float16)
 
-	X = X.contiguous()
-	A = torch.empty((*X.shape[:-1], X.size(-2)), device=X.device, dtype=X.dtype)
-	AA = torch.empty_like(A)
-	B = torch.empty_like(A)
-	C = torch.empty_like(X)
+	I = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
+	R = _sym_addmm(X, X.mT, I, beta=0)
 
-	is_large_matrix = G.size(-2) > 1024 or G.size(-1) > 1024
-	_mm = torch.bmm if X.ndim > 2 else torch.mm
-	_addmm = torch.baddbmm if X.ndim > 2 else torch.addmm
+	coeffs = group.coeffs[:group.iters]
+	for i, (a, b, c) in enumerate(coeffs):
+		# Gram Newton-Schulz: https://tridao.me/blog/2026/gram-newton-schulz/
+		if i in group.restarts and i != 0:
+			X = Q @ X
+			R = _sym_addmm(X, X.mT, I, beta=0)
 
-	for (a, b, c) in group.coeffs[:group.iters]:
-		_mmt_assign(X, A) # A = X @ X.mT
-		_mmt_assign(A, AA) # AA = A @ A.mT - note that AA = AA^T because A is symmetrical.
-		A.mul_(b) # A = b * A
-		torch.add(A, AA, alpha=c, out=B) # B = A + c * AA
+		Z = _sym_addmm(R, R, R, alpha=c, beta=b)
+		Q = _sym_addmm(Q, Z, Q, beta=a) if i != 0 and i not in group.restarts else Z + a * I
+		if i < len(coeffs) - 1 and i + 1 not in group.restarts:
+			RZ = _sym_addmm(R, Z, R, beta=a)
+			R = _sym_addmm(Z, RZ, RZ, beta=a)
 
-		if is_large_matrix:
-			_mm(B, X, out=C) # C = B @ X
-			C.add_(X, alpha=a) # C = C + a * X
-		else:
-			_addmm(X, B, X, beta=a, out=C) # C = a * X + B @ X
-
-		X, C = C, X
-
-	if G.size(-2) > G.size(-1):
-		X = X.mT
-
-	return X
+	X = X.mT @ Q if should_transpose else Q @ X
+	return X.to(dtype=dtype)
 
 @torch.no_grad()
 def _per_neuron_norm(u: torch.Tensor, m2: torch.Tensor | None, group: _THORNParameterGroup):
