@@ -299,6 +299,7 @@ class _THORNParameterGroup:
 	lower_bound: float = field(default=1e-3)
 	safety_factor: float = field(default=0.05)
 	cushion: float = field(default=0.02)
+	momentum_align: bool = field(default=False)
 	coeffs: list[tuple[float, float, float]] = field(init=False)
 	restarts: list[int] = field(init=False)
 
@@ -409,6 +410,21 @@ def _compute_rect(group: _THORNParameterGroup, step: float | int):
 		) ** float(group.rectify)
 	else:
 		return 1.0
+
+def _w1rand(s: int) -> tuple[int, int]:
+	C = 0xD07EBC63274654C7
+	s = (s + C) & 0xFFFFFFFFFFFFFFFF
+	t = s * (s ^ C)
+	return s, ((t >> 64) ^ t) & 0xFFFFFFFFFFFFFFFF
+
+def _momentum_aligned_mask(g: torch.Tensor, state: dict, group: _THORNParameterGroup, *, tau: float = 2.0, p: float = 0.9) -> float:
+	if not group.momentum_align:
+		return 1.0
+	# momentum-aligned gradient masking: http://arxiv.org/abs/2602.15322
+	s_t = torch.sigmoid(nn.functional.cosine_similarity(g.flatten(), state['moment'].flatten(), dim=0) / tau)
+	state['s'] = p * state['s'] + (1 - p) * s_t.item()
+	state['random_state'], mask = _w1rand(state['random_state'])
+	return state['s'] * (1.0 if mask % 2 == 0 else 0.0)
 
 @dataclass
 class _DistributedTHORNState:
@@ -554,7 +570,8 @@ class _DistributedTHORNState:
 		group: _THORNParameterGroup,
 		step: int,
 		rank: int,
-		compute_stream: cuda.Stream
+		compute_stream: cuda.Stream,
+		scale: float = 1.0
 	):
 		with torch.cuda.stream(compute_stream):
 			if self.scatter_event is None:
@@ -569,7 +586,7 @@ class _DistributedTHORNState:
 
 			u = self.scattered_u.view_as(p)
 			u = _weight_decay(p, u, group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, step))
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, step) * scale)
 
 			self.scattered_u = None
 			u_dtensor = None
@@ -588,6 +605,7 @@ class THORNOrthogonalizedParameterGroup(TypedDict, total=True):
 	cushion: NotRequired[float]
 	target_rms: NotRequired[float]
 	rectify: NotRequired[bool]
+	momentum_align: NotRequired[bool]
 	coeffs: NotRequired[list[tuple[float, float, float]]]
 
 class THORNNonOrthogonalizedParameterGroup(TypedDict, total=True):
@@ -598,6 +616,7 @@ class THORNNonOrthogonalizedParameterGroup(TypedDict, total=True):
 	weight_decay: NotRequired[float]
 	eps: NotRequired[float]
 	rectify: NotRequired[bool]
+	momentum_align: NotRequired[bool]
 	none_grad: NotRequired[bool]
 
 THORNParameterGroup = Union[THORNOrthogonalizedParameterGroup, THORNNonOrthogonalizedParameterGroup]
@@ -622,8 +641,9 @@ class THORN(Optimizer):
 		iters: int = 5,
 		rectify: bool = False,
 		lower_bound: float = 1e-3,
-		safety_factor: float = 0.02,
+		safety_factor: float = 0.05,
 		cushion: float = 0.02,
+		momentum_align: bool = False,
 		gradient_release: bool = False
 	):
 		...
@@ -744,12 +764,13 @@ class THORN(Optimizer):
 		state = self.state[p]
 		g = _resize(p.grad)
 
+		magma_scale = _momentum_aligned_mask(g, state, group)
 		u = self._update_momentum(p, g, group)
-		if (int(state['step'].item()) + 1) % self._update_rate == 0:
+		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
 			u = _per_neuron_norm(u, state['moment2'], group)
 			u = _weight_decay(p, u.view_as(p), group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, state['step'].item()))
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, state['step']) * magma_scale)
 
 		if group.none_grad:
 			del g
@@ -757,16 +778,20 @@ class THORN(Optimizer):
 
 	def _sharded_ortho_step(self, params: list[DTensor], group: _THORNParameterGroup):
 		update_params = []
+		update_scales = {}
 		for p in params:
 			g = p.grad
 			if g is None:
 				continue
 
 			g = _resize(g)
+			state = self.state[p]
+			magma_scale = _momentum_aligned_mask(g, state, group)
 			g = self._update_momentum(p, g, group)
-			if (int(self.state[p]['step'].item()) + 1) % self._update_rate == 0:
+			if magma_scale != 0.0 and (self.state[p]['step'] + 1) % self._update_rate == 0:
 				p.grad = g.view_as(p)
 				update_params.append(p)
+				update_scales[id(p)] = magma_scale
 			else:
 				del g
 				p.grad = None
@@ -804,9 +829,10 @@ class THORN(Optimizer):
 				state.update_param(
 					p,
 					group,
-					step=self.state[p]['step'].item(),
+					step=self.state[p]['step'],
 					rank=self.rank,
-					compute_stream=self.compute_stream
+					compute_stream=self.compute_stream,
+					scale=update_scales[id(p)]
 				)
 				self.state[p]['step'] += 1
 
@@ -836,13 +862,15 @@ class THORN(Optimizer):
 
 			state = self.state[p]
 			if 'step' not in state:
-				state['step'] = torch.ones((), device=g.device)
+				state['step'] = 1
+				state['random_state'] = torch.randint(0, 1 << 52, (), dtype=torch.uint64).item()
+				state['s'] = 1.0
 				if group.orthogonalize:
 					g = _resize(g)
 					state['moment'] = torch.zeros_like(g)
 					state['moment2'] = torch.zeros((g.shape[0], 1), dtype=g.dtype, device=g.device)
 				else:
-					state['z'] = torch.clone(p, memory_format=torch.preserve_format)
+					state['moment'] = torch.zeros_like(g)
 					state['variance'] = torch.zeros_like(g)
 
 			if isinstance(p.data, DTensor):
@@ -863,36 +891,30 @@ class THORN(Optimizer):
 			else:
 				g = p.grad
 
-				step = state['step'].item()
+				step = state['step']
 				beta1, beta2 = group.betas
 
+				magma_scale = _momentum_aligned_mask(g, state, group)
 				rect = _compute_rect(group, step)
-				lr = group.lr * rect
-				lr_max = state['lr_max'] = max(lr, state.get('lr_max', 0))
 
-				w = lr_max ** 2.0
-				w_sum = state['w_sum'] = state.get('w_sum', 0) + w
-				c_t = w / w_sum if w_sum > 0 else 0
-
-				z = state['z']
+				momentum = state['moment']
 				variance = state['variance']
 
+				momentum.lerp_(g, weight=1 - beta1)
 				variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
 				if rect > 0.0:
-					denom = variance.div(1 - beta2 ** step).sqrt_().add_(group.eps)
-					u = g.div_(denom)
+					denom = variance.div(1 - beta2 ** step).sqrt_()
+					# atan2 instead of div per https://arxiv.org/pdf/2407.05872
+					u = momentum.atan2(denom)
 				else:
-					u = g
+					# clone because _weight_decay modifies in place
+					u = momentum.clone()
 
-				should_update = (int(state['step'].item()) + 1) % self._update_rate == 0
+				should_update = magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0
 				if should_update:
 					u = _weight_decay(p, u, group.weight_decay)
 
-				# Schedule-free update: http://arxiv.org/abs/2405.15682
-				z.sub_(u, alpha=lr)
-				if should_update:
-					p.lerp_(end=z, weight=c_t)
-					p.add_(u, alpha=lr * (beta1 * (1 - c_t) - 1))
+				p.sub_(u, alpha=group.lr * rect * magma_scale)
 
 				if group.none_grad:
 					del g
