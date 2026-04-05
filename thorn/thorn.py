@@ -900,28 +900,12 @@ class THORN(Optimizer):
 
 			state['step'] += 1
 
-	@torch.no_grad()
-	def eval(self):
-		for group in self.param_groups:
-			for p in group['params']:
-				state = self.state[p]
-				if 'z' in state:
-					p.lerp_(end=state['z'].to(p.device), weight=1 - 1 / group['betas'][0])
-
-	@torch.no_grad()
-	def train(self):
-		for group in self.param_groups:
-			for p in group['params']:
-				state = self.state[p]
-				if 'z' in state:
-					p.lerp_(end=state['z'].to(p.device), weight=1 - group['betas'][0])
-
 	@overload
-	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: None = None) -> None: ...
+	def step(self, closure: None = None, *, param: Optional[torch.nn.Parameter] = None) -> None: ...
 	@overload
-	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: Callable[[], float]) -> float: ...
+	def step(self, closure: Callable[[], float], *, param: Optional[torch.nn.Parameter] = None) -> float: ...
 	@torch.no_grad()
-	def step(self, *, param: Optional[torch.nn.Parameter] = None, closure: Optional[Callable[[], float]] = None) -> Optional[float]: # type: ignore
+	def step(self, closure: Optional[Callable[[], float]] = None, *, param: Optional[torch.nn.Parameter] = None) -> Optional[float]:
 		loss = None
 		if closure is not None:
 			with torch.enable_grad():
