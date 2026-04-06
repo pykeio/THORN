@@ -294,7 +294,7 @@ class _THORNParameterGroup:
 	weight_decay: float = field(default=0.1)
 	betas: tuple[float, float] = field(default_factory=lambda: (0.95, 0.95))
 	iters: int = field(default=5)
-	rectify: bool = field(default=False)
+	rectify: bool = field(default=True)
 	target_rms: float = field(default=0.2)
 	lower_bound: float = field(default=1e-3)
 	safety_factor: float = field(default=0.05)
@@ -586,7 +586,7 @@ class _DistributedTHORNState:
 
 			u = self.scattered_u.view_as(p)
 			u = _weight_decay(p, u, group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, step) * scale)
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * scale)
 
 			self.scattered_u = None
 			u_dtensor = None
@@ -639,7 +639,7 @@ class THORN(Optimizer):
 		weight_decay: float = 0.1,
 		betas: tuple[float, float] = (0.95, 0.95),
 		iters: int = 5,
-		rectify: bool = False,
+		rectify: bool = True,
 		lower_bound: float = 1e-3,
 		safety_factor: float = 0.05,
 		cushion: float = 0.02,
@@ -770,7 +770,7 @@ class THORN(Optimizer):
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
 			u = _per_neuron_norm(u, state['moment2'], group)
 			u = _weight_decay(p, u.view_as(p), group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * _compute_rect(group, state['step']) * magma_scale)
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * magma_scale)
 
 		if group.none_grad:
 			del g

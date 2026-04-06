@@ -63,7 +63,7 @@ $\beta_1$ and $\beta_2$ work differently than Adam for orthogonalized parameters
 
 There are a few more knobs you can tune besides the usual:
 - `none_grad` (`bool`, default `True`) automatically sets gradients to `None` after the optimizer completes an update.
-- `rectify` (`bool`, default `False`) applies the variance rectification term from [RAdam][radam]. This achieves the same effect as LR warmup, slowing updates very early in training to allow the momentum buffers to settle.
+- `rectify` (`bool`, default `True`) applies the variance rectification term from [RAdam][radam] to stabilize the momentum for non-orthogonalized parameters during the early stages of training.
 - `momentum_align` (`bool`, default `False`) scales updates based on their alignment with the momentum & randomly masks updates. Per [Magma][magma], this combination can improve learning by ~10% and is stable over a much larger range of learning rates. Start with a 2-3x higher LR when enabling.
 - `target_rms` (`float`, default `0.2`): The LR for orthogonalized layers is scaled so the RMS update roughly matches that of Adam, so Adam's LR can be reused. Adam's RMS update is often between $0.2–0.4$. This can also be set to $0$ to match the LR scaling of *Jordan et al*, so vanilla Muon's LR can be reused instead.
 
