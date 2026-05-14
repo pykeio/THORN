@@ -15,3 +15,6 @@ build-backend = "hatchling.build"
 
 [project.urls]
 "Source code" = "https://github.com/pykeio/THORN"
+
+[tool.ty.environment]
+python = ".venv"
