@@ -61,16 +61,17 @@ if _use_triton:
 		A, B, C, O,
 		alpha, beta,
 		M, K,
-		stride_am, stride_ak,
-		stride_bk, stride_bn,
-		stride_cm, stride_cn,
-		stride_om, stride_on,
+		stride_ab, stride_am, stride_ak,
+		stride_bb, stride_bk, stride_bn,
+		stride_cb, stride_cm, stride_cn,
+		stride_ob, stride_om, stride_on,
 		BLOCK_SIZE_M: tl.constexpr,
 		BLOCK_SIZE_K: tl.constexpr,
 		GROUP_SIZE_M: tl.constexpr,
 	):
 		# adapted from https://github.com/nil0x9/flash-muon
 		pid = tl.program_id(axis=0)
+		batch_id = tl.program_id(axis=1)
 		num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
 		num_pid_n = tl.cdiv(M, BLOCK_SIZE_M)
 		num_pid_in_group = GROUP_SIZE_M * num_pid_n
@@ -79,6 +80,11 @@ if _use_triton:
 		group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
 		pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
 		pid_n = (pid % num_pid_in_group) // group_size_m
+
+		A += batch_id * stride_ab
+		B += batch_id * stride_bb
+		C += batch_id * stride_cb
+		O += batch_id * stride_ob
 
 		if pid_m > pid_n:
 			return
@@ -131,46 +137,65 @@ def _sym_addmm(
 	"""
 	out = beta * C + alpha * (A @ B), assuming A @ B and C are symmetrical
 
-	A = (M, K), B = (K, M), C/out = (M, M)
+	A = (...N, M, K)
+	B = (...N, K, M)
+	C = (...N, M, M) or (M, M)
+	out = (...N, M, M)
 	"""
 	assert A.is_cuda and B.is_cuda and C.is_cuda
 	assert A.device == B.device == C.device
 	assert A.dtype == B.dtype == C.dtype
-	assert A.ndim == 2 and B.ndim == 2 and C.ndim == 2
+	assert A.ndim == B.ndim and A.ndim >= 2
+	assert C.ndim >= 2
 
-	M, K = A.shape
-	assert B.shape == (K, M), f"B must be ({K}, {M}), got {tuple(B.shape)}"
-	assert C.shape == (M, M), f"C must be ({M}, {M}), got {tuple(C.shape)}"
+	*N, M, K = A.shape
+	assert B.shape == (*N, K, M), f"B must be ({*N, K, M}), got {tuple(B.shape)}"
+	assert C.shape[-2:] == (M, M), f"C must be (..., {M}, {M}), got {tuple(C.shape)}"
 
-	A = A.contiguous()
-	B = B.contiguous()
-	C = C.contiguous()
+	assert C.shape == A.shape or C.ndim == 2
+
+	NN = 1
+	for d in N:
+		NN *= d
 
 	if out is not None:
-		assert out.shape == (M, M), f"out must be ({M}, {M}), got {tuple(out.shape)}"
+		assert out.shape == (*N, M, M), f"out must be ({*N, M, M}), got {tuple(out.shape)}"
 		assert out.dtype == A.dtype
 		assert out.device == A.device
-		O = out
+		assert out.is_contiguous()
+
+	A = A.contiguous().reshape(NN, M, K)
+	B = B.contiguous().reshape(NN, K, M)
+
+	if C.ndim == 2:
+		C = C.contiguous()
+		stride_cb = 0
+	else:
+		C = C.contiguous().reshape(NN, M, M)
+		stride_cb = C.stride(0)
+
+	if out is not None:
+		O = out.reshape(NN, M, M)
 	elif _use_triton:
-		O = torch.empty((M, M), dtype=A.dtype, device=A.device)
+		O = torch.empty((NN, M, M), dtype=A.dtype, device=A.device)
 
 	if not _use_triton:
 		# torch.addmm doesn't support out == C like our kernel does, so we can't pass out here
-		O = torch.addmm(C, A, B, alpha=alpha, beta=beta)
+		O = torch.baddbmm(C, A, B, alpha=alpha, beta=beta)
 	else:
-		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) ** 2,)
+		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) ** 2, NN)
 		with torch.cuda.device(A.device.index):
 			_sym_addmm_kernel[grid](
 				A, B, C, O,
 				alpha, beta,
 				M, K,
-				A.stride(0), A.stride(1),
-				B.stride(0), B.stride(1),
-				C.stride(0), C.stride(1),
-				O.stride(0), O.stride(1)
+				A.stride(0), A.stride(1), A.stride(2),
+				B.stride(0), B.stride(1), B.stride(2),
+				stride_cb, C.stride(-2), C.stride(-1),
+				O.stride(0), O.stride(1), O.stride(2),
 			)
 
-	return O
+	return O.reshape(*N, M, M)
 
 try:
 	if environ.get('THORN_COMPILE') != '1':
@@ -323,11 +348,6 @@ class _THORNParameterGroup:
 		)
 		self.restarts = _gram_ns_restarts(*self.coeffs)
 
-def _resize(g: torch.Tensor):
-	if g.ndim > 2: # for conv filters
-		g = g.reshape(g.size(0), -1).contiguous()
-	return g
-
 @_optional_compile(dynamic=False, fullgraph=True)
 @torch.no_grad()
 def _polar_decomp(X: torch.Tensor, group: _THORNParameterGroup):
@@ -388,7 +408,7 @@ def _lr_scale_ortho(p: torch.Tensor, target_rms: float = 0.2):
 	if target_rms != 0.0:
 		# Scale LR to match RMS update of AdamW so AdamW's LR can be reused
 		# per formula 4 of https://arxiv.org/pdf/2502.16982
-		return target_rms * (max(p.shape[:2]) ** 0.5)
+		return target_rms * (max(1, *p.shape[-2:]) ** 0.5)
 	else:
 		# Match original behavior of Jordan et al
 		return max(1, p.size(-2) / p.size(-1)) ** 0.5
@@ -469,7 +489,7 @@ class _DistributedTHORNState:
 	):
 		with cuda.stream(comm_stream):
 			assert p.grad is not None
-			g = cast(DTensor, _resize(p.grad).to(dtype=torch.float32))
+			g = cast(DTensor, p.grad.to(dtype=torch.float32))
 			gather_list = [
 				torch.empty_like(g.to_local(), dtype=torch.float32)
 				for _ in range(dist.get_world_size(group=self.process_group))
@@ -523,7 +543,7 @@ class _DistributedTHORNState:
 
 				self.computed_u = u
 
-			self.scattered_u = torch.empty_like(_resize(p.to_local()), dtype=torch.float32) # type: ignore
+			self.scattered_u = torch.empty_like(p.to_local(), dtype=torch.float32) # type: ignore
 			self.compute_event = cast(torch.Event, cuda.Event())
 			self.compute_event.record()
 			u = None
@@ -584,8 +604,7 @@ class _DistributedTHORNState:
 			if rank == self.worker_rank:
 				self.computed_u = None
 
-			u = self.scattered_u.view_as(p)
-			u = _weight_decay(p, u, group.weight_decay)
+			u = _weight_decay(p, self.scattered_u, group.weight_decay)
 			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * scale)
 
 			self.scattered_u = None
@@ -723,8 +742,6 @@ class THORN(Optimizer):
 			if g is None:
 				continue
 
-			g = _resize(g)
-
 			flops = _DistributedTHORNState._calc_flops(g, group.iters)
 			param_to_flops[id(p)] = flops
 
@@ -762,14 +779,14 @@ class THORN(Optimizer):
 	def _base_ortho_step(self, p: Parameter, group: _THORNParameterGroup):
 		assert p.grad is not None
 		state = self.state[p]
-		g = _resize(p.grad)
+		g = p.grad
 
 		magma_scale = _momentum_aligned_mask(g, state, group)
 		u = self._update_momentum(p, g, group)
 		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
 			u = _per_neuron_norm(u, state['moment2'], group)
-			u = _weight_decay(p, u.view_as(p), group.weight_decay)
+			u = _weight_decay(p, u, group.weight_decay)
 			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * magma_scale)
 
 		if group.none_grad:
@@ -784,12 +801,11 @@ class THORN(Optimizer):
 			if g is None:
 				continue
 
-			g = _resize(g)
 			state = self.state[p]
 			magma_scale = _momentum_aligned_mask(g, state, group)
 			g = self._update_momentum(p, g, group)
 			if magma_scale != 0.0 and (self.state[p]['step'] + 1) % self._update_rate == 0:
-				p.grad = g.view_as(p)
+				p.grad = g
 				update_params.append(p)
 				update_scales[id(p)] = magma_scale
 			else:
@@ -866,9 +882,8 @@ class THORN(Optimizer):
 				state['random_state'] = torch.randint(0, 1 << 52, (), dtype=torch.uint64).item()
 				state['s'] = 1.0
 				if group.orthogonalize:
-					g = _resize(g)
 					state['moment'] = torch.zeros_like(g)
-					state['moment2'] = torch.zeros((g.shape[0], 1), dtype=g.dtype, device=g.device)
+					state['moment2'] = torch.zeros((*g.shape[:-1], 1), dtype=g.dtype, device=g.device)
 				else:
 					state['moment'] = torch.zeros_like(g)
 					state['variance'] = torch.zeros_like(g)
