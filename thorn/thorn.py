@@ -920,7 +920,7 @@ class THORN(Optimizer):
 				if rect > 0.0:
 					denom = variance.div(1 - beta2 ** step).sqrt_()
 					# atan2 instead of div per https://arxiv.org/pdf/2407.05872
-					u = momentum.atan2(denom)
+					u = momentum.div(1 - beta1 ** step).atan2_(denom)
 				else:
 					# clone because _weight_decay modifies in place
 					u = momentum.clone()
