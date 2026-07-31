@@ -25,6 +25,7 @@ import torch.cuda as cuda
 import torch.distributed as dist
 from torch.distributed.tensor import DTensor, Replicate, Shard
 import torch.nn as nn
+import torch.nn.functional as F
 from torch.nn import Parameter
 from torch.optim import Optimizer
 from torch.optim.optimizer import _get_value
@@ -320,7 +321,7 @@ class _THORNParameterGroup:
 	betas: tuple[float, float] = field(default_factory=lambda: (0.95, 0.95))
 	iters: int = field(default=5)
 	rectify: bool = field(default=True)
-	target_rms: float = field(default=0.2)
+	gain_lr: float = field(default=1e-3)
 	lower_bound: float = field(default=1e-3)
 	safety_factor: float = field(default=0.05)
 	cushion: float = field(default=0.02)
@@ -404,14 +405,8 @@ def _weight_decay(
 		update.addcmul_(p, mask.mul_(weight_decay))
 	return update
 
-def _lr_scale_ortho(p: torch.Tensor, target_rms: float = 0.2):
-	if target_rms != 0.0:
-		# Scale LR to match RMS update of AdamW so AdamW's LR can be reused
-		# per formula 4 of https://arxiv.org/pdf/2502.16982
-		return target_rms * (max(1, *p.shape[-2:]) ** 0.5)
-	else:
-		# Match original behavior of Jordan et al
-		return max(1, p.size(-2) / p.size(-1)) ** 0.5
+def _lr_scale_ortho(p: torch.Tensor):
+	return (max(*p.shape[-2:]) / min(*p.shape[-2:])) ** 0.5
 
 @torch.no_grad()
 def _compute_rect(group: _THORNParameterGroup, step: float | int):
@@ -605,7 +600,7 @@ class _DistributedTHORNState:
 				self.computed_u = None
 
 			u = _weight_decay(p, self.scattered_u, group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * scale)
+			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u) * scale)
 
 			self.scattered_u = None
 			u_dtensor = None
@@ -622,7 +617,7 @@ class THORNOrthogonalizedParameterGroup(TypedDict, total=True):
 	lower_bound: NotRequired[float]
 	safety_factor: NotRequired[float]
 	cushion: NotRequired[float]
-	target_rms: NotRequired[float]
+	gain_lr: NotRequired[float]
 	rectify: NotRequired[bool]
 	momentum_align: NotRequired[bool]
 	coeffs: NotRequired[list[tuple[float, float, float]]]
@@ -782,12 +777,35 @@ class THORN(Optimizer):
 		g = p.grad
 
 		magma_scale = _momentum_aligned_mask(g, state, group)
+
+		gain = F.softplus(state['row_gain']) * F.softplus(state['col_gain'])
+		p_hat = p / gain
+		p_g = p_hat * g
+		g.mul_(gain)
+
+		def _adam_step(g, momentum, variance, step, beta1 = 0.9, beta2 = 0.95):
+			momentum.lerp_(g, weight=1 - beta1)
+			variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+			denom = variance.div(1 - beta2 ** step).sqrt_()
+			return momentum.div(1 - beta1 ** step).atan2_(denom)
+
 		u = self._update_momentum(p, g, group)
 		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
-			u = _per_neuron_norm(u, state['moment2'], group)
-			u = _weight_decay(p, u, group.weight_decay)
-			p.data.sub_(u, alpha=group.lr * _lr_scale_ortho(u, target_rms=group.target_rms) * magma_scale)
+
+			p_hat.sub_(u, alpha=group.lr * _lr_scale_ortho(u) * magma_scale)
+			p_hat.mul_(state['target_norm'] / (p_hat.norm(dim=(-2, -1), keepdim=True) + 1e-8))
+
+			row_gain = F.softplus(state['row_gain'])
+			col_gain = F.softplus(state['col_gain'])
+
+			grad_row = (p_g * col_gain).sum(dim=-1) * F.sigmoid(state['row_gain']).squeeze(-1)
+			grad_col = (p_g * row_gain).sum(dim=-2) * F.sigmoid(state['col_gain']).squeeze(-2)
+			state['row_gain'].sub_(_adam_step(grad_row.unsqueeze(-1), state['row_gain_moment'], state['row_gain_variance'], state['step']), alpha=group.gain_lr)
+			state['col_gain'].sub_(_adam_step(grad_col.unsqueeze(-2), state['col_gain_moment'], state['col_gain_variance'], state['step']), alpha=group.gain_lr)
+
+			gain = F.softplus(state['row_gain']) * F.softplus(state['col_gain'])
+			p.data.copy_(p_hat * gain)
 
 		if group.none_grad:
 			del g
@@ -883,7 +901,13 @@ class THORN(Optimizer):
 				state['s'] = 1.0
 				if group.orthogonalize:
 					state['moment'] = torch.zeros_like(g)
-					state['moment2'] = torch.zeros((*g.shape[:-1], 1), dtype=g.dtype, device=g.device)
+					# softplus(ln(e - 1)) = 1
+					state['row_gain'] = torch.full((*g.shape[:-1], 1), 0.5413248546, dtype=g.dtype, device=g.device)
+					state['col_gain'] = torch.full((*g.shape[:-2], 1, *g.shape[-1:]), 0.5413248546, dtype=g.dtype, device=g.device)
+					for k in ['row_gain', 'col_gain']:
+						state[f'{k}_moment'] = torch.zeros_like(state[k])
+						state[f'{k}_variance'] = torch.zeros_like(state[k])
+					state['target_norm'] = p.norm(dim=(-2, -1), keepdim=True)
 				else:
 					state['moment'] = torch.zeros_like(g)
 					state['variance'] = torch.zeros_like(g)
