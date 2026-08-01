@@ -778,9 +778,12 @@ class THORN(Optimizer):
 
 		magma_scale = _momentum_aligned_mask(g, state, group)
 
-		gain = F.softplus(state['row_gain']) * F.softplus(state['col_gain'])
-		p_hat = p / gain
-		p_g = p_hat * g
+		# recover direction
+		row_gain = F.softplus(state['row_gain'])
+		col_gain = F.softplus(state['col_gain'])
+		gain = row_gain * col_gain
+		p.div_(gain)
+		p_g = p * g
 		g.mul_(gain)
 
 		def _adam_step(g, momentum, variance, step, beta1 = 0.9, beta2 = 0.95):
@@ -793,19 +796,17 @@ class THORN(Optimizer):
 		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
 
-			p_hat.sub_(u, alpha=group.lr * _lr_scale_ortho(u) * magma_scale)
-			p_hat.mul_(state['target_norm'] / (p_hat.norm(dim=(-2, -1), keepdim=True) + 1e-8))
+			p.sub_(u, alpha=group.lr * _lr_scale_ortho(u) * magma_scale)
+			p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1), keepdim=True) + 1e-8))
 
-			row_gain = F.softplus(state['row_gain'])
-			col_gain = F.softplus(state['col_gain'])
-
-			grad_row = (p_g * col_gain).sum(dim=-1) * F.sigmoid(state['row_gain']).squeeze(-1)
-			grad_col = (p_g * row_gain).sum(dim=-2) * F.sigmoid(state['col_gain']).squeeze(-2)
+			grad_row = (p_g * col_gain).sum(dim=-1).mul_(F.sigmoid(state['row_gain']).squeeze(-1))
+			grad_col = (p_g * row_gain).sum(dim=-2).mul_(F.sigmoid(state['col_gain']).squeeze(-2))
 			state['row_gain'].sub_(_adam_step(grad_row.unsqueeze(-1), state['row_gain_moment'], state['row_gain_variance'], state['step']), alpha=group.gain_lr)
 			state['col_gain'].sub_(_adam_step(grad_col.unsqueeze(-2), state['col_gain_moment'], state['col_gain_variance'], state['step']), alpha=group.gain_lr)
 
-			gain = F.softplus(state['row_gain']) * F.softplus(state['col_gain'])
-			p.data.copy_(p_hat * gain)
+		# reassemble
+		p.mul_(F.softplus(state['row_gain']))
+		p.mul_(F.softplus(state['col_gain']))
 
 		if group.none_grad:
 			del g
