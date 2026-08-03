@@ -441,6 +441,26 @@ def _momentum_aligned_mask(g: torch.Tensor, state: dict, group: _THORNParameterG
 	state['random_state'], mask = _w1rand(state['random_state'])
 	return state['s'] * (1.0 if mask % 2 == 0 else 0.0)
 
+def _adam_step(
+	g: torch.Tensor,
+	momentum: torch.Tensor,
+	variance: torch.Tensor,
+	step: int | torch.Tensor,
+	beta1: float = 0.9,
+	beta2: float = 0.95,
+	degenerate = False
+):
+	momentum.lerp_(g, weight=1 - beta1)
+	variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
+	if not degenerate:
+		denom = variance.div(1 - beta2 ** step).sqrt_()
+		# atan2 instead of div per https://arxiv.org/pdf/2407.05872
+		u = momentum.div(1 - beta1 ** step).atan2_(denom)
+	else:
+		# clone because we might later call _weight_decay which modifies in place
+		u = momentum.clone()
+	return u
+
 @dataclass
 class _DistributedTHORNState:
 	worker_rank: int
@@ -786,12 +806,6 @@ class THORN(Optimizer):
 		p_g = p * g
 		g.mul_(gain)
 
-		def _adam_step(g, momentum, variance, step, beta1 = 0.9, beta2 = 0.95):
-			momentum.lerp_(g, weight=1 - beta1)
-			variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-			denom = variance.div(1 - beta2 ** step).sqrt_()
-			return momentum.div(1 - beta1 ** step).atan2_(denom)
-
 		u = self._update_momentum(p, g, group)
 		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
 			u = _polar_decomp(u, group).to(dtype=p.dtype)
@@ -902,16 +916,21 @@ class THORN(Optimizer):
 				state['s'] = 1.0
 				if group.orthogonalize:
 					state['moment'] = torch.zeros_like(g)
-					# softplus(ln(e - 1)) = 1
+				else:
+					state['moment'] = torch.zeros_like(g)
+					state['variance'] = torch.zeros_like(g)
+				# softplus(ln(e - 1)) = 1
+				if p.ndim > 1:
 					state['row_gain'] = torch.full((*g.shape[:-1], 1), 0.5413248546, dtype=g.dtype, device=g.device)
 					state['col_gain'] = torch.full((*g.shape[:-2], 1, *g.shape[-1:]), 0.5413248546, dtype=g.dtype, device=g.device)
 					for k in ['row_gain', 'col_gain']:
 						state[f'{k}_moment'] = torch.zeros_like(state[k])
 						state[f'{k}_variance'] = torch.zeros_like(state[k])
-					state['target_norm'] = p.norm(dim=(-2, -1), keepdim=True)
 				else:
-					state['moment'] = torch.zeros_like(g)
-					state['variance'] = torch.zeros_like(g)
+					state['gain'] = torch.full((), 0.5413248546, dtype=g.dtype, device=g.device)
+					state['gain_moment'] = torch.zeros((), dtype=g.dtype, device=g.device)
+					state['gain_variance'] = torch.zeros((), dtype=g.dtype, device=g.device)
+				state['target_norm'] = p.norm(dim=(-2, -1) if g.ndim > 1 else -1, keepdim=True)
 
 			if isinstance(p.data, DTensor):
 				if all(isinstance(placement, Replicate) for placement in cast(DTensor, p).placements) or not group.orthogonalize:
@@ -937,24 +956,39 @@ class THORN(Optimizer):
 				magma_scale = _momentum_aligned_mask(g, state, group)
 				rect = _compute_rect(group, step)
 
-				momentum = state['moment']
-				variance = state['variance']
-
-				momentum.lerp_(g, weight=1 - beta1)
-				variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
-				if rect > 0.0:
-					denom = variance.div(1 - beta2 ** step).sqrt_()
-					# atan2 instead of div per https://arxiv.org/pdf/2407.05872
-					u = momentum.div(1 - beta1 ** step).atan2_(denom)
+				# recover direction
+				if p.ndim > 1:
+					row_gain = F.softplus(state['row_gain'])
+					col_gain = F.softplus(state['col_gain'])
+					gain = row_gain * col_gain
 				else:
-					# clone because _weight_decay modifies in place
-					u = momentum.clone()
+					gain = F.softplus(state['gain'])
+				p.div_(gain)
+				p_g = p * g
+				g.mul_(gain)
+
+				u = _adam_step(g, state['moment'], state['variance'], step, beta1, beta2, degenerate=rect == 0.0)
 
 				should_update = magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0
 				if should_update:
 					u = _weight_decay(p, u, group.weight_decay)
+					p.sub_(u, alpha=group.lr * rect * magma_scale)
+					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1) if p.ndim > 1 else -1, keepdim=True) + 1e-8))
 
-				p.sub_(u, alpha=group.lr * rect * magma_scale)
+					if p.ndim > 1:
+						grad_row = (p_g * col_gain).sum(dim=-1).mul_(F.sigmoid(state['row_gain']).squeeze(-1))
+						grad_col = (p_g * row_gain).sum(dim=-2).mul_(F.sigmoid(state['col_gain']).squeeze(-2))
+						state['row_gain'].sub_(_adam_step(grad_row.unsqueeze(-1), state['row_gain_moment'], state['row_gain_variance'], state['step']), alpha=group.gain_lr)
+						state['col_gain'].sub_(_adam_step(grad_col.unsqueeze(-2), state['col_gain_moment'], state['col_gain_variance'], state['step']), alpha=group.gain_lr)
+					else:
+						grad_gain = (p_g * gain).sum().mul_(F.sigmoid(state['gain']))
+						state['gain'].sub_(_adam_step(grad_gain, state['gain_moment'], state['gain_variance'], state['step']), alpha=group.gain_lr)
+
+				if p.ndim > 1:
+					p.mul_(F.softplus(state['row_gain']))
+					p.mul_(F.softplus(state['col_gain']))
+				else:
+					p.mul_(F.softplus(state['gain']))
 
 				if group.none_grad:
 					del g
