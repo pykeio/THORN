@@ -18,7 +18,7 @@ from dataclasses import dataclass, field, fields, MISSING
 from functools import partial, lru_cache
 from itertools import combinations
 from os import environ
-from typing import cast, overload, Callable, Literal, Optional, TypedDict, Union, NotRequired, TYPE_CHECKING
+from typing import cast, overload, Any, Callable, Literal, Optional, TypedDict, Union, NotRequired, TYPE_CHECKING
 
 import torch
 import torch.distributed as dist
@@ -839,6 +839,7 @@ class THORNOrthoGroup(TypedDict, total=True):
 	scaling_mode: NotRequired[Literal['md', 'moonlight', 'jordan']]
 	target_rms: NotRequired[float]
 	decouple_md: NotRequired[bool]
+	target_norm: NotRequired[_TargetNorm]
 	gain_lr: NotRequired[float]
 	split_gain: NotRequired[bool]
 	momentum_align: NotRequired[bool]
@@ -859,6 +860,7 @@ class THORNNonOrthoGroup(TypedDict, total=True):
 	rectify: NotRequired[bool]
 	momentum_align: NotRequired[bool]
 	decouple_md: NotRequired[bool]
+	target_norm: NotRequired[_TargetNorm]
 	gain_lr: NotRequired[float]
 	split_gain: NotRequired[bool]
 
@@ -925,9 +927,10 @@ class THORN(Optimizer):
 
 		super().__init__(cast(list[dict], param_groups), defaults)
 
+		self._param_to_group: dict[int, dict[str, Any]] = {}
 		for group in self.param_groups:
 			for p in group['params']:
-				self.state[p]['group'] = group
+				self._param_to_group[id(p)] = group
 
 		if isinstance(params, nn.Module) and conf.get('gradient_release', False):
 			self.setup_gradient_release(params)
@@ -1304,8 +1307,7 @@ class THORN(Optimizer):
 				params = group['params']
 				self._step_params(params, _THORNParameterGroup.from_kwargs(**group))
 		else:
-			state = self.state[param]
-			group = _THORNParameterGroup.from_kwargs(**state['group'])
+			group = _THORNParameterGroup.from_kwargs(**self._param_to_group[id(param)])
 			self._step_params([param], group)
 
 		return loss
