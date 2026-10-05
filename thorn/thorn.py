@@ -1264,6 +1264,11 @@ class THORN(Optimizer):
 						u = _weight_decay(p.index_select(0, idxs), u, group.weight_decay)
 						p.index_add_(0, idxs, u, alpha=-group.lr * rect * magma_scale)
 
+					state['step'] += 1
+					if group.none_grad:
+						del g
+						p.grad = None
+
 					continue
 
 				magma_scale = _momentum_aligned_mask(g, state, group)
