@@ -15,7 +15,7 @@
 ############################################################################
 
 from dataclasses import dataclass, field, fields, MISSING
-from functools import partial, lru_cache
+from functools import partial, lru_cache, wraps
 from itertools import combinations
 from os import environ
 from typing import cast, overload, Any, Callable, Literal, Optional, TypedDict, Union, NotRequired, TYPE_CHECKING
@@ -48,49 +48,47 @@ if _use_triton:
 
 	_autotune_conf = [
 		triton.Config(
-			{'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k, 'GROUP_SIZE_M': grp_sz},
+			{'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k},
 			num_stages=n_stages, num_warps=n_warps,
 		)
 		for blk_m    in [32, 64, 128]
 		for blk_k    in [32, 64]
-		for grp_sz   in [8]
 		for n_stages in [3, 4, 5]
 		for n_warps  in [4, 8]
 	]
 
-	@triton.autotune(configs=_autotune_conf, key=['M', 'K'])
+	@triton.autotune(configs=_autotune_conf, key=['M', 'K', '_NB'])
+	@triton.heuristics(values={'HAS_C': lambda args: args['C'] is not None, 'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0})
 	@triton.jit
 	def _sym_addmm_kernel(
 		A, B, C, O,
 		alpha, beta,
-		M, K,
+		M, K, _NB,
 		stride_ab, stride_am, stride_ak,
 		stride_bb, stride_bk, stride_bn,
 		stride_cb, stride_cm, stride_cn,
 		stride_ob, stride_om, stride_on,
 		BLOCK_SIZE_M: tl.constexpr,
 		BLOCK_SIZE_K: tl.constexpr,
-		GROUP_SIZE_M: tl.constexpr,
+		HAS_C: tl.constexpr,
+		EVEN_K: tl.constexpr,
 	):
 		# adapted from https://github.com/nil0x9/flash-muon
 		pid = tl.program_id(axis=0)
-		batch_id = tl.program_id(axis=1)
-		num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
-		num_pid_n = tl.cdiv(M, BLOCK_SIZE_M)
-		num_pid_in_group = GROUP_SIZE_M * num_pid_n
-		group_id = pid // num_pid_in_group
-		first_pid_m = group_id * GROUP_SIZE_M
-		group_size_m = min(num_pid_m - first_pid_m, GROUP_SIZE_M)
-		pid_m = first_pid_m + ((pid % num_pid_in_group) % group_size_m)
-		pid_n = (pid % num_pid_in_group) // group_size_m
+		batch_id = tl.program_id(axis=1).to(tl.int64)
+
+		# ???
+		r = ((tl.sqrt(8.0 * pid.to(tl.float32) + 1.0) - 1.0) * 0.5).to(tl.int32)
+		r = tl.where(r * (r + 1) // 2 > pid, r - 1, r)
+		r = tl.where((r + 1) * (r + 2) // 2 <= pid, r + 1, r)
+		pid_n = r
+		pid_m = pid - r * (r + 1) // 2
 
 		A += batch_id * stride_ab
 		B += batch_id * stride_bb
-		C += batch_id * stride_cb
+		if HAS_C:
+			C += batch_id * stride_cb
 		O += batch_id * stride_ob
-
-		if pid_m > pid_n:
-			return
 
 		offs_m = (pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
 		offs_n = (pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)) % M
@@ -102,9 +100,13 @@ if _use_triton:
 		acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_M), dtype=tl.float32)
 
 		for k in range(0, tl.cdiv(K, BLOCK_SIZE_K)):
-			mask_k = offs_k < K - k * BLOCK_SIZE_K
-			a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
-			b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
+			if EVEN_K:
+				a = tl.load(a_ptrs)
+				b = tl.load(b_ptrs)
+			else:
+				mask_k = offs_k < K - k * BLOCK_SIZE_K
+				a = tl.load(a_ptrs, mask=mask_k[None, :], other=0.0)
+				b = tl.load(b_ptrs, mask=mask_k[:, None], other=0.0)
 			acc = tl.dot(a, b, acc)
 			a_ptrs += BLOCK_SIZE_K * stride_ak
 			b_ptrs += BLOCK_SIZE_K * stride_bk
@@ -113,8 +115,11 @@ if _use_triton:
 		offs_on = pid_n * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
 		block_mask = (offs_om[:, None] < M) & (offs_on[None, :] < M)
 
-		c_ptrs = C + stride_cm * offs_om[:, None] + stride_cn * offs_on[None, :]
-		c = tl.load(c_ptrs, mask=block_mask, other=0.0).to(tl.float32)
+		if HAS_C:
+			c_ptrs = C + stride_cm * offs_om[:, None] + stride_cn * offs_on[None, :]
+			c = tl.load(c_ptrs, mask=block_mask, other=0.0).to(tl.float32)
+		else:
+			c = 0
 
 		o_ptrs = O + stride_om * offs_om[:, None] + stride_on * offs_on[None, :]
 		o = (alpha * acc + beta * c).to(A.dtype.element_ty)
@@ -128,14 +133,13 @@ elif not _has_triton:
 	import warnings
 	warnings.warn('Triton is not installed, so THORN will fall back to non-symmetric matmul. Installing Triton can speed up optimizer.step() by up to 50%; the effect would be most notable on larger models.')
 
-@torch.no_grad()
-def _sym_addmm(
+@torch.library.custom_op('thorn::sym_addmm', mutates_args=())
+def _sym_addmm_impl(
 	A: torch.Tensor,
 	B: torch.Tensor,
-	C: torch.Tensor,
-	alpha: float = 1.0,
-	beta: float = 1.0,
-	out: torch.Tensor | None = None,
+	C: torch.Tensor | None,
+	alpha: float,
+	beta: float
 ) -> torch.Tensor:
 	"""
 	out = beta * C + alpha * (A @ B), assuming A @ B and C are symmetrical
@@ -145,80 +149,117 @@ def _sym_addmm(
 	C = (...N, M, M) or (M, M)
 	out = (...N, M, M)
 	"""
-	assert A.device == B.device == C.device
-	assert A.dtype == B.dtype == C.dtype
+	assert A.device == B.device
+	assert C is None or A.device == C.device
+	assert A.dtype == B.dtype
+	assert C is None or A.dtype == C.dtype
 	assert A.ndim == B.ndim and A.ndim >= 2
-	assert C.ndim >= 2
+	assert C is None or C.ndim >= 2
 
 	*N, M, K = A.shape
 	assert B.shape == (*N, K, M), f"B must be ({*N, K, M}), got {tuple(B.shape)}"
-	assert C.shape[-2:] == (M, M), f"C must be (..., {M}, {M}), got {tuple(C.shape)}"
-
-	assert C.shape == A.shape or C.ndim == 2
+	assert C is None or C.shape[-2:] == (M, M), f"C must be (..., {M}, {M}), got {tuple(C.shape)}"
+	assert C is None or C.ndim == 2 or C.shape == (*N, M, M), f"C must be ({*N, M, M}) or ({M}, {M}), got {tuple(C.shape)}"
 
 	NN = 1
 	for d in N:
 		NN *= d
+	assert NN <= 65535
 
-	if out is not None:
-		assert out.shape == (*N, M, M), f"out must be ({*N, M, M}), got {tuple(out.shape)}"
-		assert out.dtype == A.dtype
-		assert out.device == A.device
-		assert out.is_contiguous()
+	A = A.reshape(NN, M, K)
+	B = B.reshape(NN, K, M)
 
-	A = A.contiguous().reshape(NN, M, K)
-	B = B.contiguous().reshape(NN, K, M)
-
-	if C.ndim == 2:
-		C = C.contiguous()
+	if C is None or C.ndim == 2:
 		stride_cb = 0
 	else:
-		C = C.contiguous().reshape(NN, M, M)
+		C = C.reshape(NN, M, M)
 		stride_cb = C.stride(0)
 
-	if out is not None:
-		O = out.reshape(NN, M, M)
-	elif _use_triton:
-		O = torch.empty((NN, M, M), dtype=A.dtype, device=A.device)
+	if not _use_triton or not (A.is_cuda and B.is_cuda and (C is None or C.is_cuda)):
+		if C is not None:
+			O = torch.baddbmm(C, A, B, alpha=alpha, beta=beta)
+		else:
+			O = torch.mm(A, B).mul_(alpha)
+		return O.reshape(*N, M, M)
 
-	if not _use_triton or not (A.is_cuda and B.is_cuda and C.is_cuda):
-		# note torch.addmm doesn't support out == C like our kernel does, so we can't pass out here
-		O = torch.baddbmm(C, A, B, alpha=alpha, beta=beta)
-	else:
-		grid = lambda META: (triton.cdiv(M, META['BLOCK_SIZE_M']) ** 2, NN)
-		with torch.cuda.device(A.device.index):
-			_sym_addmm_kernel[grid](
-				A, B, C, O,
-				alpha, beta,
-				M, K,
-				A.stride(0), A.stride(1), A.stride(2),
-				B.stride(0), B.stride(1), B.stride(2),
-				stride_cb, C.stride(-2), C.stride(-1),
-				O.stride(0), O.stride(1), O.stride(2),
-			)
+	O = torch.empty((NN, M, M), dtype=A.dtype, device=A.device)
+	NB = min(1 << (NN - 1).bit_length(), 8)
+
+	with torch.cuda.device(A.device):
+		def grid(META: dict[str, int]):
+			t = triton.cdiv(M, META['BLOCK_SIZE_M'])
+			return (t * (t + 1) // 2, NN)
+
+		_sym_addmm_kernel[grid](
+			A, B, C, O,
+			alpha, beta,
+			M, K, NB,
+			A.stride(0), A.stride(1), A.stride(2),
+			B.stride(0), B.stride(1), B.stride(2),
+			stride_cb, C.stride(-2) if C is not None else 0, C.stride(-1) if C is not None else 0,
+			O.stride(0), O.stride(1), O.stride(2),
+		)
 
 	return O.reshape(*N, M, M)
 
-try:
-	if environ.get('THORN_COMPILE') not in ['1', 'true', 'True']:
-		raise Exception()
+@_sym_addmm_impl.register_fake
+def __sym_addmm_impl_fake(A, B, C, alpha, beta):
+	*N, M, _ = A.shape
+	return A.new_empty((*N, M, M))
 
-	@torch.compile(dynamic=False, fullgraph=True)
-	@torch.no_grad()
-	def test(x: torch.Tensor):
-		return x + 1.
+def _sym_addmm(
+	A: torch.Tensor,
+	B: torch.Tensor,
+	C: torch.Tensor | None,
+	alpha: float = 1.0,
+	beta: float = 1.0,
+) -> torch.Tensor:
+	return _sym_addmm_impl(A, B, C, float(alpha), float(beta))
 
-	x = test(torch.tensor([1.0, 2.0]).cuda())
-	assert torch.allclose(x.cpu(), torch.tensor([2.0, 3.0]))
+def _compile_enabled() -> bool:
+	flag = environ.get('THORN_COMPILE', '').strip().lower()
+	if flag in ('0', 'false', 'False'):
+		return False
+	elif flag in ('1', 'true', 'True'):
+		return True
+	return _use_triton and torch.cuda.is_available()
 
-	del x
-	del test
-	_optional_compile = torch.compile
-except:
-	def _optional_compile(model: None = None, *, fullgraph: bool = False, dynamic: bool = False):
-		def fn(c):
-			return c
-		return fn
+def _optional_compile[T: Callable](fn: T) -> T:
+	state = { 'impl': cast(T, None), 'works': False }
+
+	@wraps(fn)
+	def wrapper(*args, **kwargs):
+		impl = state['impl']
+		if impl is None:
+			if _compile_enabled():
+				try:
+					import torch._dynamo.config as dynamo_config
+					for name in ('recompile_limit', 'cache_size_limit'):
+						if hasattr(dynamo_config, name):
+							setattr(dynamo_config, name, max(getattr(dynamo_config, name), limit))
+				except Exception:
+					pass
+
+				impl = torch.compile(fn, dynamic=False, fullgraph=True)
+			else:
+				impl = fn
+			state['impl'] = impl
+
+		if impl is fn or state['works']:
+			return impl(*args, **kwargs) # ty: ignore
+
+		try:
+			out = impl(*args, **kwargs) # ty: ignore
+		except torch.cuda.OutOfMemoryError:
+			raise
+		except Exception as e:
+			warnings.warn(f'torch.compile failed: "{type(e).__name__}: {e}". THORN will fall back to eager mode; set THORN_COMPILE=0 to silence this warning')
+			state['impl'] = fn
+			return fn(*args, **kwargs)
+		state['works'] = True
+		return out
+
+	return cast(T, wrapper)
 
 @lru_cache(maxsize=None)
 def _optimal_composition(l: float, num_iters: int, safety_factor_eps: float = 0.0, cushion: float = 0.0):
@@ -395,36 +436,62 @@ class _THORNParameterGroup:
 			target_norm = target_norm.to(dtype=p.dtype, device=p.device)
 		return target_norm
 
-@_optional_compile(dynamic=False, fullgraph=True)
-@torch.no_grad()
-def _polar_decomp(X: torch.Tensor, group: _THORNParameterGroup):
+def _baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, alpha: float = 1.0, beta: float = 1.0):
+	*N, M, K = batch1.shape
+	P = batch2.shape[-1]
+	NN = 1
+	for d in N:
+		NN *= d
+	return torch.baddbmm(
+		input.broadcast_to((*N, M, P)).reshape(NN, M, P),
+		batch1.reshape(NN, M, K),
+		batch2.reshape(NN, K, P),
+		alpha=alpha,
+		beta=beta
+	).reshape(*N, M, P)
+
+def _polar_decomp_impl(X: torch.Tensor, coeffs: tuple, restarts: tuple):
 	dtype = X.dtype
+	gram = max(X.shape[-2:]) > min(X.shape[-2:])
 	if should_transpose := X.size(-2) > X.size(-1):
 		X = X.mT
 
 	X = X.to(torch.float32) # need to do norm in float32
-	X /= X.norm(dim=(-2, -1), keepdim=True) + 1e-6
+	X = X / (X.norm(dim=(-2, -1), keepdim=True) + 1e-8)
 	# since the magnitudes of these matrices are ~1, prefer float16 over bfloat16 for its greater precision in this range
 	X = X.to(torch.float16)
 
-	I = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
-	R = _sym_addmm(X, X.mT, I, beta=0)
+	if gram:
+		I = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
+		R = _sym_addmm(X, X.mT, None)
 
-	coeffs = group.coeffs[:group.iters]
-	for i, (a, b, c) in enumerate(coeffs):
-		# Gram Newton-Schulz: https://tridao.me/blog/2026/gram-newton-schulz/
-		if i in group.restarts and i != 0:
-			X = Q @ X
-			R = _sym_addmm(X, X.mT, I, beta=0)
+		for i, (a, b, c) in enumerate(coeffs):
+			# Gram Newton-Schulz: https://tridao.me/blog/2026/gram-newton-schulz/
+			if i in restarts and i != 0:
+				X = Q @ X
+				R = _sym_addmm(X, X.mT, None)
 
-		Z = _sym_addmm(R, R, R, alpha=c, beta=b)
-		Q = _sym_addmm(Q, Z, Q, beta=a) if i != 0 and i not in group.restarts else Z + a * I
-		if i < len(coeffs) - 1 and i + 1 not in group.restarts:
-			RZ = _sym_addmm(R, Z, R, beta=a)
-			R = _sym_addmm(Z, RZ, RZ, beta=a)
+			Z = _sym_addmm(R, R, R, alpha=c, beta=b)
+			Q = _sym_addmm(Q, Z, Q, beta=a) if i != 0 and i not in restarts else Z + a * I
+			if i < len(coeffs) - 1 and i + 1 not in restarts:
+				RZ = _sym_addmm(R, Z, R, beta=a)
+				R = _sym_addmm(Z, RZ, RZ, beta=a)
 
-	X = X.mT @ Q if should_transpose else Q @ X
+		X = X.mT @ Q if should_transpose else Q @ X
+	else:
+		for (a, b, c) in coeffs:
+			A = _sym_addmm(X, X.mT, None)
+			B = _sym_addmm(A, A, A, alpha=c, beta=b)
+			X = _baddbmm(X, B, X, beta=a)
+
+		X = X.mT if should_transpose else X
+
 	return X.to(dtype=dtype)
+
+_polar_decomp_compiled = _optional_compile(_polar_decomp_impl)
+@torch.no_grad()
+def _polar_decomp(X: torch.Tensor, group: _THORNParameterGroup):
+	return _polar_decomp_compiled(X, tuple(group.coeffs[:group.iters]), tuple(group.restarts))
 
 def _needs_neuron_norm(p: torch.Tensor, group: _THORNParameterGroup) -> bool:
 	# Only apply per-neuron normalization to tall matrices, per https://arxiv.org/pdf/2606.27715
