@@ -520,7 +520,7 @@ def _momentum_aligned_mask(
 		s_t = torch.sigmoid(cos_sim / tau)
 	else:
 		s_t = torch.sigmoid(nn.functional.cosine_similarity(g_flat, m_flat, dim=0) / tau)
-	state['s'] = p * state['s'] + (1 - p) * s_t.item()
+	state['s'] = p * state['s'] + (1 - p) * s_t
 	state['random_state'], mask = _w1rand(state['random_state'])
 	return state['s'] * (1.0 if mask % 2 == 0 else 0.0)
 
@@ -1217,7 +1217,7 @@ class THORN(Optimizer):
 						seed = container[0]
 
 					state['random_state'] = seed
-					state['s'] = 1.0
+					state['s'] = torch.ones((), dtype=p.dtype, device=p.device)
 
 			if isinstance(p.data, DTensor):
 				if all(isinstance(placement, Replicate) for placement in cast(DTensor, p).placements) or not group.orthogonalize:
