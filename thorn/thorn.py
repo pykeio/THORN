@@ -17,6 +17,7 @@
 from dataclasses import dataclass, field, fields, MISSING
 from functools import partial, lru_cache, wraps
 from itertools import combinations
+from math import prod
 from os import environ
 from typing import cast, overload, Any, Callable, Literal, Optional, TypedDict, Union, NotRequired, TYPE_CHECKING
 
@@ -161,9 +162,7 @@ def _sym_addmm_impl(
 	assert C is None or C.shape[-2:] == (M, M), f"C must be (..., {M}, {M}), got {tuple(C.shape)}"
 	assert C is None or C.ndim == 2 or C.shape == (*N, M, M), f"C must be ({*N, M, M}) or ({M}, {M}), got {tuple(C.shape)}"
 
-	NN = 1
-	for d in N:
-		NN *= d
+	NN = prod(N)
 	assert NN <= 65535
 
 	A = A.reshape(NN, M, K)
@@ -368,6 +367,7 @@ if TYPE_CHECKING:
 		def current_stream() -> torch.Stream: ...
 
 _TargetNorm = Union[Literal['init', 'min', 'max'], Callable[[torch.Tensor], Union[torch.Tensor, float]]]
+_OrthoCtx = tuple[torch.Tensor, torch.Tensor | None, float] # g, p_g, magma_scale
 
 @dataclass
 class _THORNParameterGroup:
@@ -439,9 +439,7 @@ class _THORNParameterGroup:
 def _baddbmm(input: torch.Tensor, batch1: torch.Tensor, batch2: torch.Tensor, alpha: float = 1.0, beta: float = 1.0):
 	*N, M, K = batch1.shape
 	P = batch2.shape[-1]
-	NN = 1
-	for d in N:
-		NN *= d
+	NN = prod(N)
 	return torch.baddbmm(
 		input.broadcast_to((*N, M, P)).reshape(NN, M, P),
 		batch1.reshape(NN, M, K),
@@ -941,6 +939,8 @@ class THORN(Optimizer):
 	comm_stream: torch.Stream | None = None
 	compute_stream: torch.Stream | None = None
 
+	polar_decomp_batch_size: int = 32 * 1024 * 1024
+
 	@overload
 	def __init__(
 		self,
@@ -1083,10 +1083,11 @@ class THORN(Optimizer):
 		momentum.mul_(beta1).add_(g)
 		return g.add(momentum, alpha=beta1)
 
-	def _base_ortho_step(self, p: Parameter, group: _THORNParameterGroup):
+	def _ortho_pre(self, p: Parameter, group: _THORNParameterGroup) -> tuple[torch.Tensor | None, _OrthoCtx]:
 		assert p.grad is not None
 		state = self.state[p]
 		g = p.grad
+		p_g = None
 
 		if group.decouple_md:
 			g, p_g = _recover_direction(p, state)
@@ -1094,14 +1095,23 @@ class THORN(Optimizer):
 		magma_scale = _momentum_aligned_mask(g, state, group)
 
 		u = self._update_momentum(p, g, group)
-		if magma_scale != 0.0 and (state['step'] + 1) % self._update_rate == 0:
-			u = _polar_decomp(u, group).to(dtype=p.dtype)
+		if magma_scale == 0.0 or (state['step'] + 1) % self._update_rate != 0:
+			u = None
+		return u, (g, p_g, magma_scale)
+
+	def _ortho_post(self, p: Parameter, group: _THORNParameterGroup, u: torch.Tensor | None, ctx: _OrthoCtx):
+		g, p_g, magma_scale = ctx
+		state = self.state[p]
+
+		if u is not None:
+			u = u.to(dtype=p.dtype)
 			if _needs_neuron_norm(p, group):
 				u = _per_neuron_norm(u, state.get('target_norm'), state['moment2'], group)
 			u = _weight_decay(p, u, group.weight_decay)
 
 			p.sub_(u, alpha=group.lr * _lr_scale_ortho(u, group) * magma_scale)
 			if group.decouple_md:
+				assert p_g is not None
 				if not _needs_neuron_norm(p, group): # row norm didnt rescale to target norm so do it ourselves
 					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1), keepdim=True) + 1e-8))
 
@@ -1113,6 +1123,38 @@ class THORN(Optimizer):
 		if group.none_grad:
 			del g
 			p.grad = None
+
+	def _batched_ortho_step(self, params: list[Parameter], group: _THORNParameterGroup):
+		pending: list[tuple[Parameter, torch.Tensor, _OrthoCtx]] = []
+		buckets: dict[tuple, list[int]] = {}
+
+		for p in params:
+			u, ctx = self._ortho_pre(p, group)
+			if u is not None:
+				pending.append((p, u, ctx))
+				buckets.setdefault((tuple(u.shape), u.dtype, u.device), []).append(len(pending) - 1)
+			else:
+				self._ortho_post(p, group, None, ctx)
+
+		for (shape, _, _), idxs in buckets.items():
+			batch_size = max(1, self.polar_decomp_batch_size // max(1, prod(shape)))
+			for s in range(0, len(idxs), batch_size):
+				batch = idxs[s:s + batch_size]
+				if len(batch) == 1:
+					outs = (_polar_decomp(pending[batch[0]][1], group),)
+				else:
+					u = torch.stack([pending[i][1] for i in batch])
+					for i in batch:
+						# drop original us
+						p, _, ctx = pending[i]
+						pending[i] = (p, None, ctx) # ty: ignore
+					outs = _polar_decomp(u, group).unbind(0)
+					del u
+
+				for i, u in zip(batch, outs):
+					p, _, ctx = pending[i]
+					self._ortho_post(p, group, u, ctx)
+				del outs
 
 	def _sharded_ortho_step(self, params: list[DTensor], group: _THORNParameterGroup):
 		if self.comm_stream is None or self.compute_stream is None:
@@ -1297,10 +1339,18 @@ class THORN(Optimizer):
 		if len(distributed_params) > 0:
 			self._sharded_ortho_step(distributed_params, group)
 
+		batched_ortho: list[Parameter] = []
 		for p in regular_params:
 			state = self.state[p]
 			if group.orthogonalize:
-				self._base_ortho_step(p, group)
+				if isinstance(p.data, DTensor): # unbatched for replicate
+					u, ctx = self._ortho_pre(p, group)
+					if u is not None:
+						u = _polar_decomp(u, group)
+					self._ortho_post(p, group, u, ctx)
+				else:
+					batched_ortho.append(p)
+					continue
 			else:
 				g = p.grad
 				assert g is not None
@@ -1362,6 +1412,11 @@ class THORN(Optimizer):
 					p.grad = None
 
 			state['step'] += 1
+
+		if batched_ortho:
+			self._batched_ortho_step(batched_ortho, group)
+			for p in batched_ortho:
+				self.state[p]['step'] += 1
 
 	@overload
 	def step(self, closure: None = None, *, param: Optional[torch.nn.Parameter] = None) -> None: ...

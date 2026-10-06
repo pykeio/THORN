@@ -77,9 +77,11 @@ For best results:
 - **Keep separate matrices separate**: for attention layers, don't merge the Q, K, and V projections into one single `qkv_proj`, and for GLU-style MLPs, don't merge `up_proj` and `gate_proj` into one.
 
 ## Optional features
-If Triton is installed, THORN will use a custom kernel to speed up computation on larger matrix parameters by up to 50%. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable it if problems arise.
+If Triton is installed, THORN will use a custom kernel to speed up computation on larger matrix parameters by up to 50%. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable it if problems arise. The use of Triton also means the first `optimizer.step()` will be very slow as kernels are compiled.
 
-The `THORN_COMPILE` environment variable can be set to `1` to use `torch.compile` for a slight speed boost. This is broken on Windows, so it's disabled by default.
+THORN also tries to use `torch.compile` for additional performance; this may result in NaNs under specific (and uncommon) conditions, so the environment variable `THORN_COMPILE` can be set to `0` to disable it.
+
+THORN batches parameters together to speed up computation. If you have memory to spare, you can increase `optim.polar_decomp_batch_size` above its default of `32 * 1024 * 1024` (elements per batch); if you're short on memory, you can set it to `0` to disable batching.
 
 THORN also supports sparse gradients for embedding layers created with `nn.Embedding(sparse=True)` to save a little extra memory on single-GPU setups.
 
