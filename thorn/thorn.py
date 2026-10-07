@@ -36,30 +36,37 @@ __all__ = ['THORN', 'THORNOrthoGroup', 'THORNNonOrthoGroup', 'THORNGroup']
 _has_triton = False
 try:
 	import triton # ty:ignore[unresolved-import, unused-ignore-comment]
+	assert triton.__version__.startswith('3.')
 	_has_triton = True
-except ModuleNotFoundError:
-	pass
-except RuntimeError:
+except (ModuleNotFoundError, RuntimeError, AssertionError):
 	pass
 
 _use_triton = _has_triton and environ.get('THORN_DISABLE_TRITON') not in ['1', 'true', 'True']
 if _use_triton:
 	import triton                # ty:ignore[unresolved-import, unused-ignore-comment]
 	import triton.language as tl # ty:ignore[unresolved-import, unused-ignore-comment]
+	from triton.language.extra.cuda import libdevice # ty:ignore[unresolved-import, unused-ignore-comment]
 
-	_autotune_conf = [
-		triton.Config(
-			{'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k},
-			num_stages=n_stages, num_warps=n_warps,
-		)
-		for blk_m    in [32, 64, 128]
-		for blk_k    in [32, 64]
-		for n_stages in [3, 4, 5]
-		for n_warps  in [4, 8]
-	]
+	# really only used in _adam_update; _sym_addmm uses tf32 (tl.dot), and bf16 is probably too risky for pnn so we do f32 there
+	_TRITON_COMPUTE_DTYPE = tl.bfloat16
 
-	@triton.autotune(configs=_autotune_conf, key=['M', 'K', '_NB'])
-	@triton.heuristics(values={'HAS_C': lambda args: args['C'] is not None, 'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0})
+	@triton.autotune(
+		configs=[
+			triton.Config(
+				{'BLOCK_SIZE_M': blk_m, 'BLOCK_SIZE_K': blk_k},
+				num_stages=n_stages, num_warps=n_warps,
+			)
+			for blk_m    in [32, 64, 128]
+			for blk_k    in [32, 64]
+			for n_stages in [3, 4, 5]
+			for n_warps  in [4, 8]
+		],
+		key=['M', 'K', '_NB']
+	)
+	@triton.heuristics({
+		'HAS_C': lambda args: args['C'] is not None,
+		'EVEN_K': lambda args: args['K'] % args['BLOCK_SIZE_K'] == 0
+	})
 	@triton.jit
 	def _sym_addmm_kernel(
 		A, B, C, O,
@@ -130,9 +137,168 @@ if _use_triton:
 			ot_ptrs = O + stride_om * offs_on[:, None] + stride_on * offs_om[None, :]
 			ot_mask = (offs_on[:, None] < M) & (offs_om[None, :] < M)
 			tl.store(ot_ptrs, tl.permute(o, (1, 0)), mask=ot_mask)
+
+	@triton.jit
+	def _wd_update_helper(p, u, lr, wd, WEIGHT_DECAY: tl.constexpr):
+		if WEIGHT_DECAY:
+			u = tl.where(u * p >= 0.0, u + wd * p, u)
+		return p - lr * u
+
+	@triton.heuristics({
+		'APPLY': lambda args: args['P'] is not None and args['lr'] != 0.0,
+		'WEIGHT_DECAY': lambda args: args['wd'] > 0.0
+	})
+	@triton.jit
+	def _adam_update_kernel(
+		P, G, M, V,
+		n_elements,
+		lr, wd, beta2, w1, w2, bc1, bc2,
+		APPLY: tl.constexpr,
+		WEIGHT_DECAY: tl.constexpr,
+		DEGENERATE: tl.constexpr,
+		BLOCK_SIZE: tl.constexpr
+	):
+		offs = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+		mask = offs < n_elements
+
+		g = tl.load(G + offs, mask=mask, other=0.0).to(_TRITON_COMPUTE_DTYPE)
+		m = tl.load(M + offs, mask=mask, other=0.0).to(_TRITON_COMPUTE_DTYPE)
+		v = tl.load(V + offs, mask=mask, other=0.0).to(_TRITON_COMPUTE_DTYPE)
+
+		m = m + (g - m) * w1
+		v = v * beta2 + (g * g) * w2
+		tl.store(M + offs, m.to(M.dtype.element_ty), mask=mask)
+		tl.store(V + offs, v.to(V.dtype.element_ty), mask=mask)
+
+		if APPLY:
+			if DEGENERATE:
+				u = m
+			else:
+				u = libdevice.atan2(m / bc1, tl.sqrt(v / bc2))
+
+			p = tl.load(P + offs, mask=mask, other=0.0).to(_TRITON_COMPUTE_DTYPE)
+			tl.store(P + offs, _wd_update_helper(p, u, lr, wd, WEIGHT_DECAY=WEIGHT_DECAY).to(P.dtype.element_ty), mask=mask)
+
+	@triton.heuristics({
+		'WEIGHT_DECAY': lambda args: args['wd'] > 0.0
+	})
+	@triton.jit
+	def _wd_update_kernel(
+		P, U,
+		n_elements,
+		lr, wd,
+		WEIGHT_DECAY: tl.constexpr,
+		BLOCK_SIZE: tl.constexpr
+	):
+		offs = tl.program_id(0).to(tl.int64) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+		mask = offs < n_elements
+
+		u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32)
+		p = tl.load(P + offs, mask=mask, other=0.0).to(tl.float32)
+		tl.store(P + offs, _wd_update_helper(p, u, lr, wd, WEIGHT_DECAY).to(P.dtype.element_ty), mask=mask)
+
+	@triton.jit
+	def _pnn_row_stats_kernel(
+		U, M2, S, Rowsq,
+		N, w, eps,
+		BLOCK_SIZE: tl.constexpr
+	):
+		row = tl.program_id(0).to(tl.int64)
+
+		U += row * N
+
+		acc = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+		for n0 in range(0, N, BLOCK_SIZE):
+			cols = n0 + tl.arange(0, BLOCK_SIZE)
+			x = tl.load(U + cols, mask=cols < N, other=0.0).to(tl.float32)
+			acc += x * x
+
+		sumsq = tl.sum(acc, axis=0)
+
+		m2 = tl.load(M2 + row).to(tl.float32)
+		inv_n = 1. / N
+		m2 = m2 + w * (sumsq * inv_n - m2)
+		tl.store(M2 + row, m2.to(M2.dtype.element_ty))
+
+		s = tl.rsqrt(tl.maximum(m2.to(tl.float32), eps))
+		tl.store(S + row, s)
+		tl.store(Rowsq + row, sumsq)
+
+	@triton.jit
+	def _pnn_reduce_kernel(
+		Rowsq, S, Target, Gscale,
+		M, eps,
+		TARGET_MODE: tl.constexpr, # fro | scalar | per_mat
+		BLOCK_SIZE: tl.constexpr
+	):
+		b = tl.program_id(0).to(tl.int64)
+
+		Rowsq += b * M
+		S += b * M
+
+		total = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+		new = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
+		for m in range(0, M, BLOCK_SIZE):
+			idx = m + tl.arange(0, BLOCK_SIZE)
+			mask = idx < M
+			rowsq = tl.load(Rowsq + idx, mask=mask, other=0.0)
+			s = tl.load(S + idx, mask=mask, other=0.0)
+			total += rowsq
+			new += s * s * rowsq
+		total_s = tl.sum(total, axis=0)
+		new_s = tl.sum(new, axis=0)
+
+		if TARGET_MODE == 'fro':
+			t = tl.sqrt(total_s)
+		elif TARGET_MODE == 'scalar':
+			t = tl.load(Target).to(tl.float32)
+		else:
+			t = tl.load(Target + b).to(tl.float32)
+
+		tl.store(Gscale + b, t / tl.maximum(tl.sqrt(new_s), eps))
+
+	@triton.heuristics({
+		'APPLY': lambda args: args['P'] is not None and args['lr'] != 0.0,
+		'WEIGHT_DECAY': lambda args: args['wd'] > 0.0
+	})
+	@triton.jit
+	def _pnn_apply_kernel(
+		U, P, S, Gscale,
+		M, N,
+		lr, wd,
+		APPLY: tl.constexpr,
+		WEIGHT_DECAY: tl.constexpr,
+		BLOCK_SIZE: tl.constexpr
+	):
+		row = tl.program_id(0).to(tl.int64)
+		cols = tl.program_id(1) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+		mask = cols < N
+		offs = row * N + cols
+
+		scale = tl.load(S + row) * tl.load(Gscale + row // M)
+		u = tl.load(U + offs, mask=mask, other=0.0).to(tl.float32) * scale
+
+		if APPLY:
+			p = tl.load(P + offs, mask=mask, other=0.0).to(tl.float32)
+			tl.store(P + offs, _wd_update_helper(p, u, lr, wd, WEIGHT_DECAY).to(P.dtype.element_ty), mask=mask)
+		else:
+			tl.store(U + offs, u.to(U.dtype.element_ty), mask=mask)
 elif not _has_triton:
 	import warnings
-	warnings.warn('Triton is not installed, so THORN will fall back to non-symmetric matmul. Installing Triton can speed up optimizer.step() by up to 50%; the effect would be most notable on larger models.')
+	warnings.warn('Triton is not installed, so THORN is running without optimizations. Installing Triton can speed up optimizer.step() by up to 40%.')
+
+def _local(t: torch.Tensor) -> torch.Tensor:
+	return t.to_local() if isinstance(t, DTensor) else t
+
+def _triton_ok(*tensors: Optional[torch.Tensor], require_contiguous: bool) -> bool:
+	if not _use_triton:
+		return False
+	for t in tensors:
+		if t is None:
+			continue
+		if isinstance(t, DTensor) or not t.is_cuda or (require_contiguous and not t.is_contiguous()):
+			return False
+	return True
 
 @torch.library.custom_op('thorn::sym_addmm', mutates_args=())
 def _sym_addmm_impl(
@@ -174,11 +340,11 @@ def _sym_addmm_impl(
 		C = C.reshape(NN, M, M)
 		stride_cb = C.stride(0)
 
-	if not _use_triton or not (A.is_cuda and B.is_cuda and (C is None or C.is_cuda)):
+	if not _triton_ok(A, B, C, require_contiguous=False):
 		if C is not None:
 			O = torch.baddbmm(C, A, B, alpha=alpha, beta=beta)
 		else:
-			O = torch.mm(A, B).mul_(alpha)
+			O = torch.bmm(A, B).mul_(alpha)
 		return O.reshape(*N, M, M)
 
 	O = torch.empty((NN, M, M), dtype=A.dtype, device=A.device)
@@ -252,6 +418,7 @@ def _optional_compile[T: Callable](fn: T) -> T:
 		except torch.cuda.OutOfMemoryError:
 			raise
 		except Exception as e:
+			import warnings
 			warnings.warn(f'torch.compile failed: "{type(e).__name__}: {e}". THORN will fall back to eager mode; set THORN_COMPILE=0 to silence this warning')
 			state['impl'] = fn
 			return fn(*args, **kwargs)
@@ -367,7 +534,8 @@ if TYPE_CHECKING:
 		def current_stream() -> torch.Stream: ...
 
 _TargetNorm = Union[Literal['init', 'min', 'max'], Callable[[torch.Tensor], Union[torch.Tensor, float]]]
-_OrthoCtx = tuple[torch.Tensor, torch.Tensor | None, float] # g, p_g, magma_scale
+_Gains = tuple[torch.Tensor, torch.Tensor] | None # (row, col) or None for scalar
+_OrthoCtx = tuple[torch.Tensor, torch.Tensor | None, _Gains, float] # g, p_g, gains, magma_scale
 
 @dataclass
 class _THORNParameterGroup:
@@ -376,7 +544,7 @@ class _THORNParameterGroup:
 	lr: float
 	none_grad: bool = field(default=True)
 	weight_decay: float = field(default=0.1)
-	betas: tuple[float, float] = field(default_factory=lambda: (0.95, 0.95))
+	betas: tuple[float, float] = field(default_factory=lambda: (0.9, 0.95))
 	scaling_mode: Optional[Literal['md', 'moonlight', 'jordan']] = field(default=None)
 	target_rms: float = field(default=0.2)
 	target_norm: Optional[_TargetNorm] = field(default=None)
@@ -460,11 +628,11 @@ def _polar_decomp_impl(X: torch.Tensor, coeffs: tuple, restarts: tuple):
 	X = X.to(torch.float16)
 
 	if gram:
+		# Gram Newton-Schulz: https://tridao.me/blog/2026/gram-newton-schulz/
 		I = torch.eye(X.size(-2), device=X.device, dtype=X.dtype)
 		R = _sym_addmm(X, X.mT, None)
 
 		for i, (a, b, c) in enumerate(coeffs):
-			# Gram Newton-Schulz: https://tridao.me/blog/2026/gram-newton-schulz/
 			if i in restarts and i != 0:
 				X = Q @ X
 				R = _sym_addmm(X, X.mT, None)
@@ -491,36 +659,119 @@ _polar_decomp_compiled = _optional_compile(_polar_decomp_impl)
 def _polar_decomp(X: torch.Tensor, group: _THORNParameterGroup):
 	return _polar_decomp_compiled(X, tuple(group.coeffs[:group.iters]), tuple(group.restarts))
 
-def _needs_neuron_norm(p: torch.Tensor, group: _THORNParameterGroup) -> bool:
-	# Only apply per-neuron normalization to tall matrices, per https://arxiv.org/pdf/2606.27715
-	# I question how that would fare on non-transformers hence the `force_per_neuron_norm` flag
-	return group.betas[1] > 0 and (p.size(-2) > p.size(-1) or group.force_per_neuron_norm)
-
-@torch.no_grad()
-def _per_neuron_norm(u: torch.Tensor, target_norm: torch.Tensor | None, m2: torch.Tensor, group: _THORNParameterGroup):
-	# Per-neuron normalization, from https://arxiv.org/abs/2510.05491
-	if target_norm is None:
-		target_norm = u.norm(dim=(-2, -1), keepdim=True)
-	eps = torch.finfo(m2.dtype).eps
-	v_mean = u.square().mean(dim=-1, keepdim=True)
-	m2.lerp_(v_mean.to(m2.dtype), 1. - group.betas[1])
-	u.mul_(m2.clamp_min(eps).rsqrt_())
-	v_norm_new = u.norm(dim=(-2, -1), keepdim=True)
-	u.mul_(target_norm.div(v_norm_new.clamp_min(eps)))
-	return u
-
 @torch.no_grad()
 def _weight_decay(
 	p: torch.Tensor,
 	update: torch.Tensor,
 	weight_decay: float
 ):
-	# "Cautious" weight decay; only apply weight decay to elements in the same direction as the update
-	# https://arxiv.org/abs/2510.12402
+	"""
+	"Cautious" weight decay; only apply weight decay to elements in the same direction as the update, from https://arxiv.org/abs/2510.12402
+	"""
 	if weight_decay > 0.0:
 		mask = ((update * p) >= 0).to(dtype=p.dtype)
 		update.addcmul_(p, mask.mul_(weight_decay))
 	return update
+
+@torch.no_grad()
+def _weight_decay_update(
+	p: torch.Tensor,
+	update: torch.Tensor,
+	*,
+	weight_decay: float,
+	lr: float
+):
+	if _triton_ok(p, update, require_contiguous=False):
+		assert p.shape == update.shape
+		with torch.cuda.device(p.device):
+			_wd_update_kernel[(triton.cdiv(p.numel(), 1024),)](
+				p, update,
+				p.numel(),
+				lr, weight_decay,
+				BLOCK_SIZE=1024, num_warps=4
+			)
+		return
+
+	p.data.sub_(_weight_decay(p, update, weight_decay), alpha=lr)
+
+def _needs_neuron_norm(p: torch.Tensor, group: _THORNParameterGroup) -> bool:
+	# Only apply per-neuron normalization to tall matrices, per https://arxiv.org/pdf/2606.27715
+	# I question how that would fare on non-transformers hence the `force_per_neuron_norm` flag
+	return group.betas[1] > 0 and (p.size(-2) > p.size(-1) or group.force_per_neuron_norm)
+
+def _per_neuron_norm_update(
+	p: torch.Tensor | None,
+	u: torch.Tensor,
+	m2: torch.Tensor,
+	target_norm: torch.Tensor | None,
+	*,
+	beta2: float,
+	lr: float = 0.0,
+	weight_decay: float = 0.0
+):
+	"""
+	Per-neuron normalization, from https://arxiv.org/abs/2510.05491
+	"""
+
+	eps = float(torch.finfo(m2.dtype).eps)
+
+	if _triton_ok(p, u, m2, target_norm, require_contiguous=True):
+		if target_norm is not None and target_norm.numel() == 1:
+			mode = 'scalar'
+		elif target_norm is not None and target_norm.shape == (*u.shape[:-2], 1, 1):
+			mode = 'per_mat'
+		else:
+			mode = 'fro'
+
+		assert u.ndim >= 2 and u.numel() >= 0
+		assert m2.shape == (*u.shape[:-1], 1)
+		assert p is None or p.shape == u.shape
+
+		M, N = u.shape[-2:]
+		R = u.numel() // N
+		B = R // M
+		block_size = min(triton.next_power_of_2(N), 1024)
+		num_warps = max(1, min(8, block_size // 256))
+
+		rowsq = torch.empty(R, dtype=torch.float32, device=u.device)
+		s = torch.empty(R, dtype=torch.float32, device=u.device)
+		gscale = torch.empty(R, dtype=torch.float32, device=u.device)
+
+		with torch.cuda.device(u.device):
+			_pnn_row_stats_kernel[(R,)](
+				u, m2, s, rowsq,
+				N, 1. - beta2,
+				eps,
+				BLOCK_SIZE=block_size, num_warps=num_warps # ty: ignore
+			)
+			_pnn_reduce_kernel[(B,)](
+				rowsq, s, target_norm, gscale, M,
+				eps,
+				TARGET_MODE=mode, # ty: ignore
+				BLOCK_SIZE=1024, num_warps=4 # ty: ignore
+			)
+			_pnn_apply_kernel[(R, triton.cdiv(N, block_size))](
+				u, p, s, gscale,
+				M, N,
+				lr, weight_decay,
+				BLOCK_SIZE=block_size,
+				num_warps=num_warps
+			)
+
+		return u
+
+	if target_norm is None:
+		target_norm = u.norm(dim=(-2, -1), keepdim=True)
+
+	v_mean = u.square().mean(dim=-1, keepdim=True)
+	m2.lerp_(v_mean.to(m2.dtype), 1. - beta2)
+	u.mul_(m2.clamp_min(eps).rsqrt_())
+	v_norm_new = u.norm(dim=(-2, -1), keepdim=True)
+	u.mul_(target_norm.div(v_norm_new.clamp_min(eps)))
+
+	if p is not None:
+		_weight_decay_update(p, u, weight_decay=weight_decay, lr=lr)
+	return u
 
 def _lr_scale_ortho(p: torch.Tensor, group: _THORNParameterGroup):
 	match group.scaling_mode_:
@@ -589,15 +840,40 @@ def _momentum_aligned_mask(
 	state['random_state'], mask = _w1rand(state['random_state'])
 	return state['s'] * (1.0 if mask % 2 == 0 else 0.0)
 
-def _adam_step(
+def _adam_update(
+	p: torch.Tensor | None,
 	g: torch.Tensor,
 	momentum: torch.Tensor,
 	variance: torch.Tensor,
-	step: int | torch.Tensor,
-	beta1: float = 0.9,
-	beta2: float = 0.95,
+	step: int | float | torch.Tensor,
+	*,
+	beta1: float,
+	beta2: float,
+	lr: float,
+	weight_decay: float,
 	degenerate = False
 ):
+	g, momentum, variance = _local(g), _local(momentum), _local(variance)
+	if p is not None:
+		p = _local(p)
+
+	if _triton_ok(p, g, momentum, variance, require_contiguous=False):
+		assert g.shape == momentum.shape == variance.shape
+		assert p is None or p.shape == g.shape
+
+		step = float(step)
+		with torch.cuda.device(g.device):
+			_adam_update_kernel[(triton.cdiv(g.numel(), 1024),)](
+				p, g, momentum, variance,
+				g.numel(),
+				float(lr), float(weight_decay), float(beta2), 1.0 - float(beta1), 1.0 - float(beta2),
+				1.0 - float(beta1) ** step, 1.0 - float(beta2) ** step,
+				DEGENERATE=degenerate,
+				BLOCK_SIZE=1024,
+				num_warps=4
+			)
+		return
+
 	momentum.lerp_(g, weight=1 - beta1)
 	variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
 	if not degenerate:
@@ -605,26 +881,31 @@ def _adam_step(
 		# atan2 instead of div per https://arxiv.org/pdf/2407.05872
 		u = momentum.div(1 - beta1 ** step).atan2_(denom)
 	else:
-		# clone because we might later call _weight_decay which modifies in place
+		# clone because _weight_decay_update might modify in place
 		u = momentum.clone()
-	return u
+
+	if p is not None:
+		_weight_decay_update(p, u, weight_decay=weight_decay, lr=lr)
 
 def _recover_direction(
 	p: torch.Tensor,
 	state: dict[str, torch.Tensor]
-) -> tuple[torch.Tensor, torch.Tensor]:
+) -> tuple[torch.Tensor, torch.Tensor, _Gains]:
 	g = p.grad
 	assert g is not None
 
 	if 'row_gain' in state:
-		gain = F.softplus(state['row_gain']) * F.softplus(state['col_gain'])
+		row_gain = F.softplus(state['row_gain'])
+		col_gain = F.softplus(state['col_gain'])
+		gain, gains = row_gain * col_gain, (row_gain, col_gain)
 	else:
 		gain = F.softplus(state['gain'])
+		gains = None
 
 	p.div_(gain)
 	p_g = p * g
 	g.mul_(gain)
-	return g, p_g
+	return g, p_g, gains
 
 def _update_magnitude(
 	p_g: torch.Tensor,
@@ -638,21 +919,27 @@ def _update_magnitude(
 ):
 	d_gain = F.sigmoid(gain)
 	if gain2 is not None:
-		p_g = p_g * F.softplus(gain2)
+		p_g = p_g * gain2
 	grad = p_g.sum(dim=dim).mul_(d_gain.squeeze(dim) if dim is not None else d_gain)
-	gain.sub_(_adam_step(
+	_adam_update(
+		gain,
 		grad.unsqueeze(dim) if dim is not None else grad,
 		moment,
 		variance,
-		state['step']
-	), alpha=group.gain_lr)
+		state['step'],
+		beta1=0.9,
+		beta2=0.95,
+		lr=group.gain_lr,
+		weight_decay=0.0
+	)
 
-def _update_magnitudes(p_g: torch.Tensor, state: dict[str, torch.Tensor], group: _THORNParameterGroup):
+def _update_magnitudes(p_g: torch.Tensor, gains: _Gains, state: dict[str, torch.Tensor], group: _THORNParameterGroup):
 	if 'row_gain' in state:
+		assert gains is not None
 		_update_magnitude(
 			p_g,
 			state['row_gain'],
-			state['col_gain'],
+			gains[1],
 			-1,
 			state['row_gain_moment'],
 			state['row_gain_variance'],
@@ -662,7 +949,7 @@ def _update_magnitudes(p_g: torch.Tensor, state: dict[str, torch.Tensor], group:
 		_update_magnitude(
 			p_g,
 			state['col_gain'],
-			state['row_gain'],
+			gains[0],
 			-2,
 			state['col_gain_moment'],
 			state['col_gain_variance'],
@@ -793,7 +1080,7 @@ class _DistributedTHORNState:
 
 				u = _polar_decomp(self.gathered_grad, self.group)
 				if _needs_neuron_norm(p, self.group):
-					u = _per_neuron_norm(u, state.get('target_norm'), state['moment2'], self.group)
+					u = _per_neuron_norm_update(None, u, state['moment2'], state.get('target_norm'), beta2=self.group.betas[1])
 
 				self.computed_u = u
 
@@ -855,9 +1142,11 @@ class _DistributedTHORNState:
 			if rank == self.worker_rank:
 				self.computed_u = None
 
-			u = _weight_decay(p, u, self.group.weight_decay)
-			p.data.sub_(u, alpha=self.group.lr * _lr_scale_ortho(u, self.group) * magma_scale)
-			u = None
+			_weight_decay_update(
+				p, u,
+				weight_decay=self.group.weight_decay,
+				lr=self.group.lr * _lr_scale_ortho(u, self.group) * magma_scale
+			)
 
 			if not self.group.decouple_md:
 				return
@@ -885,9 +1174,14 @@ class _DistributedTHORNState:
 			if self.grad_gain_event is not None:
 				self.compute_stream.wait_event(self.grad_gain_event)
 				assert self.grad_gain is not None
-				state['col_gain'].sub_(
-					_adam_step(self.grad_gain.unsqueeze(-2), state['col_gain_moment'], state['col_gain_variance'], state['step']),
-					alpha=self.group.gain_lr
+				_adam_update(
+					state['col_gain'],
+					self.grad_gain.unsqueeze(-2),
+					state['col_gain_moment'],
+					state['col_gain_variance'],
+					state['step'],
+					beta1=0.9, beta2=0.95,
+					lr=self.group.gain_lr, weight_decay=0
 				)
 				self.grad_gain = None
 				self.grad_gain_event = None
@@ -949,7 +1243,7 @@ class THORN(Optimizer):
 		lr: float,
 		none_grad: bool = True,
 		weight_decay: float = 0.1,
-		betas: tuple[float, float] = (0.95, 0.95),
+		betas: tuple[float, float] = (0.9, 0.95),
 		scaling_mode: Optional[Literal['md', 'moonlight', 'jordan']] = None,
 		target_rms: float = 0.2,
 		target_norm: Optional[_TargetNorm] = None,
@@ -1087,35 +1381,40 @@ class THORN(Optimizer):
 		assert p.grad is not None
 		state = self.state[p]
 		g = p.grad
-		p_g = None
+		p_g = gains = None
 
 		if group.decouple_md:
-			g, p_g = _recover_direction(p, state)
+			g, p_g, gains = _recover_direction(p, state)
 
 		magma_scale = _momentum_aligned_mask(g, state, group)
 
 		u = self._update_momentum(p, g, group)
 		if magma_scale == 0.0 or (state['step'] + 1) % self._update_rate != 0:
 			u = None
-		return u, (g, p_g, magma_scale)
+		return u, (g, p_g, gains, magma_scale)
 
 	def _ortho_post(self, p: Parameter, group: _THORNParameterGroup, u: torch.Tensor | None, ctx: _OrthoCtx):
-		g, p_g, magma_scale = ctx
+		g, p_g, gains, magma_scale = ctx
 		state = self.state[p]
 
 		if u is not None:
 			u = u.to(dtype=p.dtype)
+			lr = group.lr * _lr_scale_ortho(u, group) * magma_scale
 			if _needs_neuron_norm(p, group):
-				u = _per_neuron_norm(u, state.get('target_norm'), state['moment2'], group)
-			u = _weight_decay(p, u, group.weight_decay)
+				_per_neuron_norm_update(
+					p, u, state['moment2'], state.get('target_norm'),
+					beta2=group.betas[1],
+					lr=lr, weight_decay=group.weight_decay
+				)
+			else:
+				_weight_decay_update(p, u, weight_decay=group.weight_decay, lr=lr)
 
-			p.sub_(u, alpha=group.lr * _lr_scale_ortho(u, group) * magma_scale)
 			if group.decouple_md:
 				assert p_g is not None
 				if not _needs_neuron_norm(p, group): # row norm didnt rescale to target norm so do it ourselves
 					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1), keepdim=True) + 1e-8))
 
-				_update_magnitudes(p_g, state, group)
+				_update_magnitudes(p_g, gains, state, group)
 
 		if group.decouple_md:
 			_reassemble_md(p, state)
@@ -1178,7 +1477,7 @@ class THORN(Optimizer):
 			state = self.state[p]
 
 			if group.decouple_md:
-				g, p_g = _recover_direction(p, state)
+				g, p_g, gains = _recover_direction(p, state)
 
 			magma_scale = _momentum_aligned_mask(g, state, group, process_group=process_group)
 			magma_scales[id(p)] = magma_scale
@@ -1192,15 +1491,22 @@ class THORN(Optimizer):
 
 			if group.decouple_md:
 				if 'row_gain' in state:
+					assert gains is not None
+
 					# compute row gain now since we already shard across rows
-					grad_row = (p_g * F.softplus(state['col_gain'])).sum(dim=-1).mul_(F.sigmoid(state['row_gain']).squeeze(-1))
-					state['row_gain'].sub_(
-						_adam_step(grad_row.unsqueeze(-1), state['row_gain_moment'], state['row_gain_variance'], state['step']),
-						alpha=group.gain_lr
+					_update_magnitude(
+						p_g,
+						state['row_gain'],
+						gains[1],
+						-1,
+						state['row_gain_moment'],
+						state['row_gain_variance'],
+						state,
+						group
 					)
 
 					# start col gain reduction so its ready by the update_param step
-					grad_col = (p_g * F.softplus(state['row_gain'])).sum(dim=-2).mul_(F.sigmoid(state['col_gain']).squeeze(-2))
+					grad_col = (p_g * gains[0]).sum(dim=-2).mul_(F.sigmoid(state['col_gain']).squeeze(-2))
 					self.comm_stream.wait_stream(self.backend.current_stream())
 					with self.backend.stream(self.comm_stream):
 						dist.all_reduce(grad_col, op=dist.ReduceOp.SUM, group=process_group)
@@ -1359,7 +1665,7 @@ class THORN(Optimizer):
 				beta1, beta2 = group.betas
 				rect = _compute_rect(group, step)
 
-				if g.is_sparse and group.decouple_md or g.sparse_dim() != 1:
+				if g.is_sparse and (group.decouple_md or g.sparse_dim() != 1):
 					p.grad = g = g.to_dense()
 				elif g.is_sparse:
 					g = g.coalesce()
@@ -1373,7 +1679,13 @@ class THORN(Optimizer):
 
 					magma_scale = _momentum_aligned_mask(g_rows, state, group, moment=moment_rows)
 
-					u = _adam_step(g_rows, moment_rows, variance_rows, step, beta1, beta2, degenerate=rect == 0.0)
+					u = _adam_update(
+						None, g_rows, moment_rows, variance_rows,
+						step,
+						beta1=beta1, beta2=beta2,
+						lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay,
+						degenerate=rect == 0.0
+					)
 					state['moment'].index_copy_(0, idxs, moment_rows)
 					state['variance'].index_copy_(0, idxs, variance_rows)
 
@@ -1391,18 +1703,20 @@ class THORN(Optimizer):
 				magma_scale = _momentum_aligned_mask(g, state, group)
 
 				if group.decouple_md:
-					g, p_g = _recover_direction(p, state)
+					g, p_g, gains = _recover_direction(p, state)
 
-				u = _adam_step(g, state['moment'], state['variance'], step, beta1, beta2, degenerate=rect == 0.0)
+				apply = magma_scale != 0.0 and (step + 1) % self._update_rate == 0
+				_adam_update(
+					p if apply else None,
+					g, state['moment'], state['variance'], state['step'],
+					beta1=beta1, beta2=beta2,
+					lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay,
+					degenerate=rect == 0.0
+				)
 
-				if magma_scale != 0.0 and (step + 1) % self._update_rate == 0:
-					u = _weight_decay(p, u, group.weight_decay)
-					p.sub_(u, alpha=group.lr * rect * magma_scale)
-
-					if group.decouple_md:
-						p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1) if p.ndim > 1 else -1, keepdim=True) + 1e-8))
-
-						_update_magnitudes(p_g, state, group)
+				if apply and group.decouple_md:
+					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1) if p.ndim > 1 else -1, keepdim=True) + 1e-8))
+					_update_magnitudes(p_g, gains, state, group)
 
 				if group.decouple_md:
 					_reassemble_md(p, state)
