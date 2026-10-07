@@ -30,7 +30,7 @@ from torch.nn import Parameter
 from torch.optim import Optimizer
 from torch.optim.optimizer import _get_value
 
-__version__ = '3.0.0'
+__version__ = '3.1.0'
 __all__ = ['THORN', 'THORNOrthoGroup', 'THORNNonOrthoGroup', 'THORNGroup']
 
 _has_triton = False

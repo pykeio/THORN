@@ -1,20 +1,63 @@
 # THORN 🌹
 THORN is an optimizer for PyTorch.
 
-THORN is primarily based on [Muon][muon], which is quickly [replacing AdamW in the language model space](https://moonshotai.github.io/Kimi-K2/). THORN itself was used to train [Earshot](https://github.com/pykeio/earshot), a tiny voice activity detection model. THORN with minimal tuning provided a +2% validation accuracy boost over hand-tuned AdamW and made Earshot the most accurate VAD we tested in spite of its small size.
+THORN is an extension of [Muon][muon], which is quickly [replacing AdamW in the language model space](https://moonshotai.github.io/Kimi-K2/). THORN itself was used to train [Earshot](https://github.com/pykeio/earshot), a tiny voice activity detection model. THORN with minimal tuning provided a +2% validation accuracy boost over hand-tuned AdamW and made Earshot the most accurate VAD we tested in spite of its small size.
 
-THORN works on any model, but it's most effective for models with lots of convolutions/linear layers. Transformer models will see the largest gains. It's best for pretraining; it doesn't provide much benefit over Adam for non-LoRA fine-tuning, unless the base model was also trained with Muon/THORN.
+THORN works on any model, but it's most effective for models with lots of convolutions/linear layers. Transformer models will see the largest gains.
 
-It won't give the *best possible* results, but you can often reuse AdamW's same LR/betas/weight decay with THORN, making it effectively a free accuracy boost:
+It won't give the *best possible* results, but you can often just reuse AdamW's same LR/betas/weight decay with THORN, making it effectively a free accuracy boost:
 
 <blockquote><figure>
-<img src="docs/lm_loss.png" width="550" />
-<figcaption><i>
+<img src="docs/tokens.svg" width="400" />
+<img src="docs/time.svg" width="400" />
+<figcaption>
 
-~300M Qwen3-based character-level causal language model on a simple dataset. $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.99$, $\lambda=0.1$ for both THORN & AdamW
+<i>Results pretraining a ~300M Qwen3-based causal language model on FineWeb-Edu between AdamW, Muon, THORN, and THORN (`decouple_md=True`). $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.95$, $\lambda=0.1$ (on non-norm params) for all optimizers.</i>
 
-</i></figcaption>
+<details>
+<summary>⚙️ <b>Setup details</b></summary>
+<br/>
+
+We don't have the resources to do a proper sweep, so the AdamW parameters were chosen purely based on ~vibes~ and all other optimizers adopted them for fair comparison. The gap between AdamW and other optimizers would almost certainly be larger with more careful tuning. NorMuon was also tested, but it was within 3% of Muon the whole run, so it was excluded from the graphs as we felt something was wrong there.
+
+Muon is the vanilla Muon from [`KellerJordan/Muon`](https://github.com/KellerJordan/Muon) patched with [Moonlight][moonlight] scaling; that is, the line `update *= max(1, grad.size(-2) / grad.size(-1))**0.5` was replaced with `update *= 0.2 * (max(1, *grad.shape[-2:]) ** 0.5)`, matching THORN's default `scaling_mode='moonlight'` behavior and allowing both to reuse AdamW's learning rate.
+
+These are the exact configurations used for each optimizer. `matrix` is a list of all matrix parameters (excluding the embedding & LM head); `embed_head` is the embedding layer & LM head; `vector` is everything else (`RMSNorm` weights).
+
+```py
+optim = AdamW([ # AdamW
+	{'params': matrix + embed_head, 'weight_decay': 0.1},
+	{'params': vector, 'weight_decay': 0.0}
+], lr=1e-3, betas=(0.9, 0.95), eps=1e-8, fused=True)
+optim = SingleDeviceMuonWithAuxAdam([ # Muon
+	{'use_muon': True, 'params': matrix, 'lr': 1e-3, 'momentum': 0.9, 'weight_decay': 0.1},
+	{'use_muon': False, 'params': embed_head, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.1},
+	{'use_muon': False, 'params': vector, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.0},
+])
+optim = SingleDeviceNorMuonWithAuxAdam([ # NorMuon
+	{'use_muon': True, 'params': matrix, 'lr': 1e-3, 'momentum': 0.9, 'beta2': 0.95, 'weight_decay': 0.1},
+	{'use_muon': False, 'params': embed_head, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.1},
+	{'use_muon': False, 'params': vector, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.0},
+])
+optim = THORN([ # THORN
+	{'orthogonalize': True, 'params': matrix, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.1},
+	{'orthogonalize': False, 'params': embed_head, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.1},
+	{'orthogonalize': False, 'params': vector, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.0},
+])
+optim = THORN([ # THORN-MD
+	{'orthogonalize': True, 'params': matrix, 'lr': 8e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.0, 'decouple_md': True},
+	{'orthogonalize': False, 'params': embed_head, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.1},
+	{'orthogonalize': False, 'params': vector, 'lr': 1e-3, 'betas': (0.9, 0.95), 'weight_decay': 0.0},
+])
+```
+
+`torch.manual_seed(3407)`, as [that's all you need](https://arxiv.org/abs/2109.08203).
+</details>
+
+</figcaption>
 </figure></blockquote>
+
+THORN works best when pretraining; it doesn't provide much benefit over Adam for non-LoRA fine-tuning, unless the base model was also trained with Muon/THORN.
 
 ## Usage
 Requires Python ≥ 3.12, PyTorch ≥ 2.6. [Triton](https://triton-lang.org/main/index.html) is optional but provides a decent speed boost. FSDP2 is supported & optimized for.
@@ -77,7 +120,7 @@ For best results:
 - **Keep separate matrices separate**: for attention layers, don't merge the Q, K, and V projections into one single `qkv_proj`, and for GLU-style MLPs, don't merge `up_proj` and `gate_proj` into one.
 
 ## Optional features
-If Triton is installed, THORN will use a custom kernel to speed up computation on larger matrix parameters by up to 50%. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable it if problems arise. The use of Triton also means the first `optimizer.step()` will be very slow as kernels are compiled.
+If Triton is installed, THORN will use custom kernels to speed up `optimizer.step()` by up to 40%. The `THORN_DISABLE_TRITON` environment variable can be set to `1` to disable the use of Triton if problems arise. The use of Triton also means the first `optimizer.step()` will be very slow as kernels are compiled.
 
 THORN also tries to use `torch.compile` for additional performance; this may result in NaNs under specific (and uncommon) conditions, so the environment variable `THORN_COMPILE` can be set to `0` to disable it.
 
@@ -115,14 +158,14 @@ for i, item in enumerate(dataset):
 		scheduler.step()
 ```
 
-With the gradient accumulation approximation (`update_rate` $\gt 1$), the *optimizer states* are accumulated over microbatches, rather than the gradients themselves; this often means a noisier update is applied. To mitigate this, you'll want to set a higher $\beta_1$ (especially for orthogonalized-update parameters) and/or use a lower learning rate.
+With the gradient accumulation approximation (`update_rate` $\gt 1$), the *optimizer states* are accumulated over microbatches, rather than the gradients themselves. To compensate, you might want to increase all $\beta_1$ to $0.95$ and/or use a lower learning rate, though note that you will *always* get worse results compared to real gradient accumulation without gradient release mode.
 
 ## Based on
 - Jordan, K., Jin, Y., Boza, V., You, J., Cesista, F., Newhouse, L., & Bernstein, J. (2024). [*Muon: An optimizer for hidden layers in neural networks.*][muon]
 - Lim, J., Lee, S., Kim, D., Kim, T., Park, E., Lee, J., … Weon, D. (2025). [*Motif 2 12.7B technical report.*](https://arxiv.org/abs/2511.07464)
 - Li, Z., Liu, L., Liang, C., Chen, W., & Zhao, T. (2025). [*NorMuon: Making Muon more efficient and scalable.*][normuon]
 - Delattre, B., Barthélemy, Q., Araujo, A., & Allauzen, A. (2023). [*Efficient Bound of Lipschitz Constant for Convolutional Layers by Gram Iteration.*](https://arxiv.org/abs/2305.16173)
-- Liu, J., Su, J., Yao, X., Jiang, Z., Lai, G., Du, Y., … Yang, Z. (2025). [*Muon is Scalable for LLM Training.*](https://arxiv.org/abs/2502.16982)
+- Liu, J., Su, J., Yao, X., Jiang, Z., Lai, G., Du, Y., … Yang, Z. (2025). [*Muon is Scalable for LLM Training.*][moonlight]
 - Pudipeddi, B., Mesmakhosroshahi, M., Xi, J., & Bharadwaj, S. (2020). [*Training Large Neural Networks with Constant Memory using a New Execution Algorithm.*](https://arxiv.org/abs/2002.05645)
 - Chen, L., Li, J., Liang, K., Su, B., Xie, C., Pierse, N. W., … Liu, Q. (2025). [*Cautious Weight Decay.*][cwd]
 - Amsel, N., Persson, D., Musco, C., & Gower, R. M. (2025). [*The Polar Express: Optimal Matrix Sign Methods and Their Application to the Muon Algorithm.*](https://arxiv.org/abs/2505.16932)
@@ -143,3 +186,4 @@ With the gradient accumulation approximation (`update_rate` $\gt 1$), the *optim
 [magma]: https://arxiv.org/abs/2602.15322
 [md]: https://arxiv.org/abs/2606.25971
 [aurora]: https://arxiv.org/abs/2606.27715
+[moonlight]: https://arxiv.org/abs/2502.16982
