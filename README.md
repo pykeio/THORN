@@ -8,8 +8,8 @@ THORN works on any model, but it's most effective for models with lots of convol
 It won't give the *best possible* results, but you can often just reuse AdamW's same LR/betas/weight decay with THORN, making it effectively a free accuracy boost:
 
 <blockquote><figure>
-<img src="docs/tokens.svg" width="400" />
-<img src="docs/time.svg" width="400" />
+<img src="docs/tokens.svg" />
+<img src="docs/time.svg" />
 <figcaption>
 
 <i>Results pretraining a ~300M Qwen3-based causal language model on FineWeb-Edu between AdamW, Muon, THORN, and THORN (`decouple_md=True`). $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.95$, $\lambda=0.1$ (on non-norm params) for all optimizers.</i>
