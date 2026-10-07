@@ -12,13 +12,13 @@ It won't give the *best possible* results, but you can often just reuse AdamW's 
 <img src="docs/time.svg" />
 <figcaption>
 
-<i>Results pretraining a ~300M Qwen3-based causal language model on FineWeb-Edu between AdamW, Muon, THORN, and THORN (`decouple_md=True`). $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.95$, $\lambda=0.1$ (on non-norm params) for all optimizers.</i>
+<i>Results pretraining a ~300M Qwen3-based causal language model on FineWeb-Edu between AdamW, Muon, THORN, and THORN (`decouple_md=True`). $\gamma=10^{-3}$ (constant), $\beta_1=0.9$, $\beta_2=0.95$, $\lambda=0.1$ (on all but `RMSNorm` weights) for all optimizers.</i>
 
 <details>
 <summary>⚙️ <b>Setup details</b></summary>
 <br/>
 
-We don't have the resources to do a proper sweep, so the AdamW parameters were chosen purely based on ~vibes~ and all other optimizers adopted them for fair comparison. The gap between AdamW and other optimizers would almost certainly be larger with more careful tuning. NorMuon was also tested, but it was within 3% of Muon the whole run, so it was excluded from the graphs as we felt something was wrong there.
+We don't have the resources to do a proper sweep, so the AdamW parameters were chosen purely based on \~vibes\~ and all other optimizers adopted them for fair comparison. The gap between AdamW and other optimizers would almost certainly be larger with more careful tuning. NorMuon was also tested, but it was within 3% of Muon the whole run, so it was excluded from the graphs as we felt something was wrong there.
 
 Muon is the vanilla Muon from [`KellerJordan/Muon`](https://github.com/KellerJordan/Muon) patched with [Moonlight][moonlight] scaling; that is, the line `update *= max(1, grad.size(-2) / grad.size(-1))**0.5` was replaced with `update *= 0.2 * (max(1, *grad.shape[-2:]) ** 0.5)`, matching THORN's default `scaling_mode='moonlight'` behavior and allowing both to reuse AdamW's learning rate.
 
