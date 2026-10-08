@@ -1679,8 +1679,10 @@ class THORN(Optimizer):
 
 					magma_scale = _momentum_aligned_mask(g_rows, state, group, moment=moment_rows)
 
-					u = _adam_update(
-						None, g_rows, moment_rows, variance_rows,
+					apply = magma_scale != 0.0 and (step + 1) % self._update_rate == 0
+					p_rows = p.index_select(0, idxs) if apply else None
+					_adam_update(
+						p_rows, g_rows, moment_rows, variance_rows,
 						step,
 						beta1=beta1, beta2=beta2,
 						lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay,
@@ -1688,10 +1690,8 @@ class THORN(Optimizer):
 					)
 					state['moment'].index_copy_(0, idxs, moment_rows)
 					state['variance'].index_copy_(0, idxs, variance_rows)
-
-					if magma_scale != 0.0 and (step + 1) % self._update_rate == 0:
-						u = _weight_decay(p.index_select(0, idxs), u, group.weight_decay)
-						p.index_add_(0, idxs, u, alpha=-group.lr * rect * magma_scale)
+					if p_rows is not None:
+						p.index_copy_(0, idxs, p_rows)
 
 					state['step'] += 1
 					if group.none_grad:
