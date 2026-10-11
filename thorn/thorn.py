@@ -401,7 +401,7 @@ def _optional_compile[T: Callable](fn: T) -> T:
 					import torch._dynamo.config as dynamo_config
 					for name in ('recompile_limit', 'cache_size_limit'):
 						if hasattr(dynamo_config, name):
-							setattr(dynamo_config, name, max(getattr(dynamo_config, name), limit))
+							setattr(dynamo_config, name, max(getattr(dynamo_config, name), 64))
 				except Exception:
 					pass
 
@@ -838,7 +838,9 @@ def _momentum_aligned_mask(
 		s_t = torch.sigmoid(nn.functional.cosine_similarity(g_flat, m_flat, dim=0) / tau)
 	state['s'] = p * state['s'] + (1 - p) * s_t
 	state['random_state'], mask = _w1rand(state['random_state'])
-	return state['s'] * (1.0 if mask % 2 == 0 else 0.0)
+	if mask % 2 != 0:
+		return 0.0
+	return state['s'].item()
 
 def _adam_update(
 	p: torch.Tensor | None,
