@@ -48,7 +48,7 @@ if _use_triton:
 	from triton.language.extra.cuda import libdevice # ty:ignore[unresolved-import, unused-ignore-comment]
 
 	# really only used in _adam_update; _sym_addmm uses tf32 (tl.dot), and bf16 is probably too risky for pnn so we do f32 there
-	_TRITON_COMPUTE_DTYPE = tl.bfloat16
+	_TRITON_COMPUTE_DTYPE = tl.float32
 
 	@triton.autotune(
 		configs=[
