@@ -782,8 +782,9 @@ def _per_neuron_norm_update(
 def _lr_scale_ortho(p: torch.Tensor, group: _THORNParameterGroup):
 	match group.scaling_mode_:
 		case 'md':
-			# https://haeggee.github.io/posts/magnitude-direction-decoupling#decoupling-magnitude-and-direction-the-details
-			return (max(*p.shape[-2:]) / min(*p.shape[-2:])) ** 0.5
+			# https://haeggee.github.io/posts/magnitude-direction-decoupling#part-1-the-axes-of-normalization-and-magnitude
+			d_out, d_in = p.size(-2), p.size(-1)
+			return max(d_out / d_in, d_in / d_out) ** 0.5
 		case 'moonlight':
 			# per formula 4 of https://arxiv.org/pdf/2502.16982
 			assert group.target_rms > 0
