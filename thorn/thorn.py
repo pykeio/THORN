@@ -564,6 +564,7 @@ class _THORNParameterGroup:
 	restarts: list[int] = field(init=False)
 	decouple_md: bool = field(default=False)
 	gain_lr: float = field(default=1e-3)
+	gain_betas: tuple[float, float] = field(default_factory=lambda: (0.9, 0.95))
 	split_gain: bool = field(default=True)
 	force_per_neuron_norm: bool = field(default=False)
 
@@ -941,11 +942,8 @@ def _update_magnitude(
 		moment,
 		variance,
 		state['step'],
-		beta1=0.9,
-		beta2=0.95,
-		lr=group.gain_lr,
-		weight_decay=0.0,
-		eps=group.eps
+		beta1=group.gain_betas[0], beta2=group.gain_betas[1],
+		lr=group.gain_lr, weight_decay=0.0, eps=group.eps
 	)
 
 def _update_magnitudes(p_g: torch.Tensor, gains: _Gains, state: dict[str, torch.Tensor], group: _THORNParameterGroup):
@@ -1195,7 +1193,7 @@ class _DistributedTHORNState:
 					state['col_gain_moment'],
 					state['col_gain_variance'],
 					state['step'],
-					beta1=0.9, beta2=0.95,
+					beta1=self.group.gain_betas[0], beta2=self.group.gain_betas[1],
 					lr=self.group.gain_lr, weight_decay=0, eps=self.group.eps
 				)
 				self.grad_gain = None
@@ -1215,6 +1213,7 @@ class THORNOrthoGroup(TypedDict, total=True):
 	decouple_md: NotRequired[bool]
 	target_norm: NotRequired[_TargetNorm]
 	gain_lr: NotRequired[float]
+	gain_betas: NotRequired[tuple[float, float]]
 	split_gain: NotRequired[bool]
 	momentum_align: NotRequired[bool]
 	force_per_neuron_norm: NotRequired[bool]
@@ -1237,6 +1236,7 @@ class THORNNonOrthoGroup(TypedDict, total=True):
 	decouple_md: NotRequired[bool]
 	target_norm: NotRequired[_TargetNorm]
 	gain_lr: NotRequired[float]
+	gain_betas: NotRequired[tuple[float, float]]
 	split_gain: NotRequired[bool]
 
 THORNGroup = Union[THORNOrthoGroup, THORNNonOrthoGroup]
@@ -1273,6 +1273,7 @@ class THORN(Optimizer):
 		gradient_release: bool = False,
 		decouple_md: bool = False,
 		gain_lr: float = 1e-3,
+		gain_betas: tuple[float, float] = (0.9, 0.95),
 		split_gain: bool = True,
 		backend = torch.cuda
 	):
