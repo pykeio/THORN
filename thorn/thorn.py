@@ -146,15 +146,17 @@ if _use_triton:
 
 	@triton.heuristics({
 		'APPLY': lambda args: args['P'] is not None and args['lr'] != 0.0,
-		'WEIGHT_DECAY': lambda args: args['wd'] > 0.0
+		'WEIGHT_DECAY': lambda args: args['wd'] > 0.0,
+		'ATAN2': lambda args: args['eps'] == 0.0
 	})
 	@triton.jit
 	def _adam_update_kernel(
 		P, G, M, V,
 		n_elements,
-		lr, wd, beta2, w1, w2, bc1, bc2,
+		lr, wd, beta2, w1, w2, bc1, bc2, eps,
 		APPLY: tl.constexpr,
 		WEIGHT_DECAY: tl.constexpr,
+		ATAN2: tl.constexpr,
 		DEGENERATE: tl.constexpr,
 		BLOCK_SIZE: tl.constexpr
 	):
@@ -174,7 +176,10 @@ if _use_triton:
 			if DEGENERATE:
 				u = m
 			else:
-				u = libdevice.atan2(m / bc1, tl.sqrt(v / bc2))
+				if ATAN2:
+					u = libdevice.atan2(m * bc1, tl.sqrt(v * bc2))
+				else:
+					u = (m * bc1) / (tl.sqrt(v * bc2) + eps)
 
 			p = tl.load(P + offs, mask=mask, other=0.0).to(_TRITON_COMPUTE_DTYPE)
 			tl.store(P + offs, _wd_update_helper(p, u, lr, wd, WEIGHT_DECAY=WEIGHT_DECAY).to(P.dtype.element_ty), mask=mask)
@@ -549,7 +554,8 @@ class _THORNParameterGroup:
 	target_rms: float = field(default=0.2)
 	target_norm: Optional[_TargetNorm] = field(default=None)
 	iters: int = field(default=5)
-	rectify: bool = field(default=True)
+	rectify: bool = field(default=False)
+	eps: float = field(default=0)
 	lower_bound: float = field(default=1e-3)
 	safety_factor: float = field(default=0.03)
 	cushion: float = field(default=0.02)
@@ -853,11 +859,15 @@ def _adam_update(
 	beta2: float,
 	lr: float,
 	weight_decay: float,
+	eps: float,
 	degenerate = False
 ):
 	g, momentum, variance = _local(g), _local(momentum), _local(variance)
 	if p is not None:
 		p = _local(p)
+
+	bc1 = 1 / (1 - beta1 ** step)
+	bc2 = 1 / (1 - beta2 ** step)
 
 	if _triton_ok(p, g, momentum, variance, require_contiguous=False):
 		assert g.shape == momentum.shape == variance.shape
@@ -869,7 +879,7 @@ def _adam_update(
 				p, g, momentum, variance,
 				g.numel(),
 				float(lr), float(weight_decay), float(beta2), 1.0 - float(beta1), 1.0 - float(beta2),
-				1.0 - float(beta1) ** step, 1.0 - float(beta2) ** step,
+				bc1, bc2, eps,
 				DEGENERATE=degenerate,
 				BLOCK_SIZE=1024,
 				num_warps=4
@@ -879,9 +889,10 @@ def _adam_update(
 	momentum.lerp_(g, weight=1 - beta1)
 	variance.mul_(beta2).addcmul_(g, g, value=1 - beta2)
 	if not degenerate:
-		denom = variance.div(1 - beta2 ** step).sqrt_()
-		# atan2 instead of div per https://arxiv.org/pdf/2407.05872
-		u = momentum.div(1 - beta1 ** step).atan2_(denom)
+		if eps == 0.0:
+			u = torch.atan2(momentum * bc1, (variance * bc2).sqrt_())
+		else:
+			u = (momentum * bc1) / (variance * bc2).sqrt_().add_(eps)
 	else:
 		# clone because _weight_decay_update might modify in place
 		u = momentum.clone()
@@ -932,7 +943,8 @@ def _update_magnitude(
 		beta1=0.9,
 		beta2=0.95,
 		lr=group.gain_lr,
-		weight_decay=0.0
+		weight_decay=0.0,
+		eps=group.eps
 	)
 
 def _update_magnitudes(p_g: torch.Tensor, gains: _Gains, state: dict[str, torch.Tensor], group: _THORNParameterGroup):
@@ -1183,7 +1195,7 @@ class _DistributedTHORNState:
 					state['col_gain_variance'],
 					state['step'],
 					beta1=0.9, beta2=0.95,
-					lr=self.group.gain_lr, weight_decay=0
+					lr=self.group.gain_lr, weight_decay=0, eps=self.group.eps
 				)
 				self.grad_gain = None
 				self.grad_gain_event = None
@@ -1219,6 +1231,7 @@ class THORNNonOrthoGroup(TypedDict, total=True):
 	weight_decay: NotRequired[float]
 	none_grad: NotRequired[bool]
 	rectify: NotRequired[bool]
+	eps: NotRequired[float]
 	momentum_align: NotRequired[bool]
 	decouple_md: NotRequired[bool]
 	target_norm: NotRequired[_TargetNorm]
@@ -1250,7 +1263,8 @@ class THORN(Optimizer):
 		target_rms: float = 0.2,
 		target_norm: Optional[_TargetNorm] = None,
 		iters: int = 5,
-		rectify: bool = True,
+		rectify: bool = False,
+		eps: float = 0,
 		lower_bound: float = 1e-3,
 		safety_factor: float = 0.03,
 		cushion: float = 0.02,
@@ -1687,7 +1701,7 @@ class THORN(Optimizer):
 						p_rows, g_rows, moment_rows, variance_rows,
 						step,
 						beta1=beta1, beta2=beta2,
-						lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay,
+						lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay, eps=group.eps,
 						degenerate=rect == 0.0
 					)
 					state['moment'].index_copy_(0, idxs, moment_rows)
@@ -1712,7 +1726,7 @@ class THORN(Optimizer):
 					p if apply else None,
 					g, state['moment'], state['variance'], state['step'],
 					beta1=beta1, beta2=beta2,
-					lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay,
+					lr=group.lr * rect * magma_scale, weight_decay=group.weight_decay, eps=group.eps,
 					degenerate=rect == 0.0
 				)
 
