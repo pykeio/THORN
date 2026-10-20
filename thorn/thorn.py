@@ -565,6 +565,7 @@ class _THORNParameterGroup:
 	decouple_md: bool = field(default=False)
 	gain_lr: float = field(default=1e-3)
 	gain_betas: tuple[float, float] = field(default_factory=lambda: (0.9, 0.95))
+	norm_axis: Optional[int | tuple[int, int]] = field(default=None)
 	split_gain: bool = field(default=True)
 	force_per_neuron_norm: bool = field(default=False)
 
@@ -594,6 +595,9 @@ class _THORNParameterGroup:
 			return 'md' if self.decouple_md else 'moonlight'
 		return self.scaling_mode
 
+	def norm_axis_(self, p: torch.Tensor) -> int | tuple[int, int]:
+		return self.norm_axis if self.norm_axis is not None else ((-2, -1) if p.ndim > 1 else -1)
+
 	def target_norm_(self, p: torch.Tensor) -> torch.Tensor | float:
 		target_norm = self.target_norm
 		if target_norm is None:
@@ -602,7 +606,7 @@ class _THORNParameterGroup:
 			target_norm = target_norm(p)
 		else:
 			match target_norm:
-				case 'init': target_norm = p.norm(dim=(-2, -1) if p.ndim > 1 else -1, keepdim=True)
+				case 'init': target_norm = p.norm(dim=self.norm_axis_(p), keepdim=True)
 				case 'min': target_norm = min(p.size(-2), p.size(-1)) ** 0.5
 				case 'max': target_norm = max(p.size(-2), p.size(-1)) ** 0.5
 		if isinstance(target_norm, (float, int)):
@@ -1733,7 +1737,7 @@ class THORN(Optimizer):
 				)
 
 				if apply and group.decouple_md:
-					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1) if p.ndim > 1 else -1, keepdim=True) + 1e-8))
+					p.mul_(state['target_norm'] / (p.norm(dim=group.norm_axis_(p), keepdim=True) + 1e-8))
 					_update_magnitudes(p_g, gains, state, group)
 
 				if group.decouple_md:
