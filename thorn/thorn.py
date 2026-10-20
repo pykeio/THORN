@@ -204,8 +204,8 @@ if _use_triton:
 
 	@triton.jit
 	def _pnn_row_stats_kernel(
-		U, M2, S, Rowsq,
-		N, w, eps,
+		U, S, Rowsq,
+		N, eps,
 		BLOCK_SIZE: tl.constexpr
 	):
 		row = tl.program_id(0).to(tl.int64)
@@ -220,12 +220,10 @@ if _use_triton:
 
 		sumsq = tl.sum(acc, axis=0)
 
-		m2 = tl.load(M2 + row).to(tl.float32)
 		inv_n = 1. / N
-		m2 = m2 + w * (sumsq * inv_n - m2)
-		tl.store(M2 + row, m2.to(M2.dtype.element_ty))
+		v_mean = sumsq * inv_n
 
-		s = tl.rsqrt(tl.maximum(m2.to(tl.float32), eps))
+		s = tl.rsqrt(tl.maximum(v_mean.to(tl.float32), eps))
 		tl.store(S + row, s)
 		tl.store(Rowsq + row, sumsq)
 
@@ -713,10 +711,8 @@ def _needs_neuron_norm(p: torch.Tensor, group: _THORNParameterGroup) -> bool:
 def _per_neuron_norm_update(
 	p: torch.Tensor | None,
 	u: torch.Tensor,
-	m2: torch.Tensor,
 	target_norm: torch.Tensor | None,
 	*,
-	beta2: float,
 	lr: float = 0.0,
 	weight_decay: float = 0.0
 ):
@@ -724,9 +720,9 @@ def _per_neuron_norm_update(
 	Per-neuron normalization, from https://arxiv.org/abs/2510.05491
 	"""
 
-	eps = float(torch.finfo(m2.dtype).eps)
+	eps = float(torch.finfo(u.dtype).eps)
 
-	if _triton_ok(p, u, m2, target_norm, require_contiguous=True):
+	if _triton_ok(p, u, target_norm, require_contiguous=True):
 		if target_norm is not None and target_norm.numel() == 1:
 			mode = 'scalar'
 		elif target_norm is not None and target_norm.shape == (*u.shape[:-2], 1, 1):
@@ -735,7 +731,6 @@ def _per_neuron_norm_update(
 			mode = 'fro'
 
 		assert u.ndim >= 2 and u.numel() >= 0
-		assert m2.shape == (*u.shape[:-1], 1)
 		assert p is None or p.shape == u.shape
 
 		M, N = u.shape[-2:]
@@ -750,8 +745,8 @@ def _per_neuron_norm_update(
 
 		with torch.cuda.device(u.device):
 			_pnn_row_stats_kernel[(R,)](
-				u, m2, s, rowsq,
-				N, 1. - beta2,
+				u, s, rowsq,
+				N,
 				eps,
 				BLOCK_SIZE=block_size, num_warps=num_warps # ty: ignore
 			)
@@ -775,8 +770,7 @@ def _per_neuron_norm_update(
 		target_norm = u.norm(dim=(-2, -1), keepdim=True)
 
 	v_mean = u.square().mean(dim=-1, keepdim=True)
-	m2.lerp_(v_mean.to(m2.dtype), 1. - beta2)
-	u.mul_(m2.clamp_min(eps).rsqrt_())
+	u.mul_(v_mean.clamp_min(eps).rsqrt_())
 	v_norm_new = u.norm(dim=(-2, -1), keepdim=True)
 	u.mul_(target_norm.div(v_norm_new.clamp_min(eps)))
 
@@ -1097,7 +1091,7 @@ class _DistributedTHORNState:
 
 				u = _polar_decomp(self.gathered_grad, self.group)
 				if _needs_neuron_norm(p, self.group):
-					u = _per_neuron_norm_update(None, u, state['moment2'], state.get('target_norm'), beta2=self.group.betas[1])
+					u = _per_neuron_norm_update(None, u, state.get('target_norm'))
 
 				self.computed_u = u
 
@@ -1424,8 +1418,7 @@ class THORN(Optimizer):
 			lr = group.lr * _lr_scale_ortho(u, group) * magma_scale
 			if _needs_neuron_norm(p, group):
 				_per_neuron_norm_update(
-					p, u, state['moment2'], state.get('target_norm'),
-					beta2=group.betas[1],
+					p, u, state.get('target_norm'),
 					lr=lr, weight_decay=group.weight_decay
 				)
 			else:
