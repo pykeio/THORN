@@ -1608,8 +1608,6 @@ class THORN(Optimizer):
 
 				if group.orthogonalize:
 					state['moment'] = torch.zeros_like(p)
-					if _needs_neuron_norm(p, group):
-						state['moment2'] = torch.zeros((*p.shape[:-1], 1), dtype=p.dtype, device=p.device)
 				else:
 					state['moment'] = torch.zeros_like(p)
 					state['variance'] = torch.zeros_like(p)
