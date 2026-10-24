@@ -229,9 +229,8 @@ if _use_triton:
 
 	@triton.jit
 	def _pnn_reduce_kernel(
-		Rowsq, S, Target, Gscale,
+		Rowsq, S, Gscale,
 		M, eps,
-		TARGET_MODE: tl.constexpr, # fro | scalar | per_mat
 		BLOCK_SIZE: tl.constexpr
 	):
 		b = tl.program_id(0).to(tl.int64)
@@ -251,14 +250,7 @@ if _use_triton:
 		total_s = tl.sum(total, axis=0)
 		new_s = tl.sum(new, axis=0)
 
-		if TARGET_MODE == 'fro':
-			t = tl.sqrt(total_s)
-		elif TARGET_MODE == 'scalar':
-			t = tl.load(Target).to(tl.float32)
-		else:
-			t = tl.load(Target + b).to(tl.float32)
-
-		tl.store(Gscale + b, t / tl.maximum(tl.sqrt(new_s), eps))
+		tl.store(Gscale + b, tl.sqrt(total_s) / tl.maximum(tl.sqrt(new_s), eps))
 
 	@triton.heuristics({
 		'APPLY': lambda args: args['P'] is not None and args['lr'] != 0.0,
@@ -711,7 +703,6 @@ def _needs_neuron_norm(p: torch.Tensor, group: _THORNParameterGroup) -> bool:
 def _per_neuron_norm_update(
 	p: torch.Tensor | None,
 	u: torch.Tensor,
-	target_norm: torch.Tensor | None,
 	*,
 	lr: float = 0.0,
 	weight_decay: float = 0.0
@@ -722,14 +713,7 @@ def _per_neuron_norm_update(
 
 	eps = float(torch.finfo(u.dtype).eps)
 
-	if _triton_ok(p, u, target_norm, require_contiguous=True):
-		if target_norm is not None and target_norm.numel() == 1:
-			mode = 'scalar'
-		elif target_norm is not None and target_norm.shape == (*u.shape[:-2], 1, 1):
-			mode = 'per_mat'
-		else:
-			mode = 'fro'
-
+	if _triton_ok(p, u, require_contiguous=True):
 		assert u.ndim >= 2 and u.numel() >= 0
 		assert p is None or p.shape == u.shape
 
@@ -751,9 +735,8 @@ def _per_neuron_norm_update(
 				BLOCK_SIZE=block_size, num_warps=num_warps # ty: ignore
 			)
 			_pnn_reduce_kernel[(B,)](
-				rowsq, s, target_norm, gscale, M,
+				rowsq, s, gscale, M,
 				eps,
-				TARGET_MODE=mode, # ty: ignore
 				BLOCK_SIZE=1024, num_warps=4 # ty: ignore
 			)
 			_pnn_apply_kernel[(R, triton.cdiv(N, block_size))](
@@ -766,13 +749,11 @@ def _per_neuron_norm_update(
 
 		return u
 
-	if target_norm is None:
-		target_norm = u.norm(dim=(-2, -1), keepdim=True)
-
+	v_norm = u.norm(dim=(-2, -1), keepdim=True)
 	v_mean = u.square().mean(dim=-1, keepdim=True)
 	u.mul_(v_mean.clamp_min(eps).rsqrt_())
 	v_norm_new = u.norm(dim=(-2, -1), keepdim=True)
-	u.mul_(target_norm.div(v_norm_new.clamp_min(eps)))
+	u.mul_(v_norm.div(v_norm_new.clamp_min(eps)))
 
 	if p is not None:
 		_weight_decay_update(p, u, weight_decay=weight_decay, lr=lr)
@@ -1091,7 +1072,7 @@ class _DistributedTHORNState:
 
 				u = _polar_decomp(self.gathered_grad, self.group)
 				if _needs_neuron_norm(p, self.group):
-					u = _per_neuron_norm_update(None, u, state.get('target_norm'))
+					u = _per_neuron_norm_update(None, u)
 
 				self.computed_u = u
 
@@ -1179,8 +1160,7 @@ class _DistributedTHORNState:
 			global_norm = self.reduced_norm.sqrt_()
 			self.reduced_norm = None
 
-			if not _needs_neuron_norm(p, self.group):
-				p.data.mul_(state['target_norm'] / (global_norm + 1e-8))
+			p.data.mul_(state['target_norm'] / (global_norm + 1e-8))
 
 			if self.grad_gain_event is not None:
 				self.compute_stream.wait_event(self.grad_gain_event)
@@ -1418,7 +1398,7 @@ class THORN(Optimizer):
 			lr = group.lr * _lr_scale_ortho(u, group) * magma_scale
 			if _needs_neuron_norm(p, group):
 				_per_neuron_norm_update(
-					p, u, state.get('target_norm'),
+					p, u,
 					lr=lr, weight_decay=group.weight_decay
 				)
 			else:
@@ -1426,8 +1406,7 @@ class THORN(Optimizer):
 
 			if group.decouple_md:
 				assert p_g is not None
-				if not _needs_neuron_norm(p, group): # row norm didnt rescale to target norm so do it ourselves
-					p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1), keepdim=True) + 1e-8))
+				p.mul_(state['target_norm'] / (p.norm(dim=(-2, -1), keepdim=True) + 1e-8))
 
 				_update_magnitudes(p_g, gains, state, group)
 
