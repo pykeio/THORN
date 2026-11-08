@@ -537,6 +537,7 @@ class _THORNParameterGroup:
 	orthogonalize: bool
 	params: list[Parameter]
 	lr: float
+	base_lr: float = field(init=False)
 	none_grad: bool = field(default=True)
 	weight_decay: float = field(default=0.1)
 	betas: tuple[float, float] = field(default_factory=lambda: (0.9, 0.95))
@@ -571,6 +572,7 @@ class _THORNParameterGroup:
 		if not (0.0 <= self.betas[1] < 1.0):
 			raise ValueError(f'Invalid beta2 `{self.betas[1]}`; should be in [0, 1)')
 
+		self.base_lr = self.lr
 		self.coeffs = _optimal_composition(
 			l=self.lower_bound,
 			num_iters=self.iters,
@@ -584,6 +586,10 @@ class _THORNParameterGroup:
 		if self.scaling_mode is None:
 			return 'md' if self.decouple_md else 'moonlight'
 		return self.scaling_mode
+
+	@property
+	def gain_lr_(self) -> float:
+		return self.gain_lr * (float(self.lr) / self.base_lr)
 
 	def norm_axis_(self, p: torch.Tensor) -> int | tuple[int, int]:
 		return self.norm_axis if self.norm_axis is not None else ((-2, -1) if p.ndim > 1 else -1)
@@ -922,7 +928,7 @@ def _update_magnitude(
 		variance,
 		state['step'],
 		beta1=group.gain_betas[0], beta2=group.gain_betas[1],
-		lr=group.gain_lr, weight_decay=0.0, eps=group.eps
+		lr=group.gain_lr_, weight_decay=0.0, eps=group.eps
 	)
 
 def _update_magnitudes(p_g: torch.Tensor, gains: _Gains, state: dict[str, torch.Tensor], group: _THORNParameterGroup):
@@ -1172,7 +1178,7 @@ class _DistributedTHORNState:
 					state['col_gain_variance'],
 					state['step'],
 					beta1=self.group.gain_betas[0], beta2=self.group.gain_betas[1],
-					lr=self.group.gain_lr, weight_decay=0, eps=self.group.eps
+					lr=self.group.gain_lr_, weight_decay=0, eps=self.group.eps
 				)
 				self.grad_gain = None
 				self.grad_gain_event = None
@@ -1183,6 +1189,7 @@ class THORNOrthoGroup(TypedDict, total=True):
 	orthogonalize: Literal[True]
 	params: list[Parameter]
 	lr: NotRequired[float]
+	# beta2 is currently unused since we do stateless NorMuon now (setting to 0 still disables it)
 	betas: NotRequired[tuple[float, float]]
 	weight_decay: NotRequired[float]
 	none_grad: NotRequired[bool]
